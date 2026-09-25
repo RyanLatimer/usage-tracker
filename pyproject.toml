@@ -1,0 +1,12 @@
+[project]
+name = "usage-tracker"
+version = "0.1.0"
+description = "Sum agent usage (sessions, messages, tokens, cost) across coding harnesses"
+requires-python = ">=3.9"
+
+[project.scripts]
+agent-usage = "usage_tracker:main"
+usage-tracker = "usage_tracker:main"
+
+[build-system]
+requires = ["setuptools>=61"]

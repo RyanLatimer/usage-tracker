@@ -1,0 +1,19 @@
+{
+  "name": "agent-usage-tui",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  },
+  "dependencies": {
+    "@opentui/core": "^0.5.12"
+  },
+  "scripts": {
+    "build": "bun build --compile ./index.ts --outfile ../dist/agent-usage",
+    "install-bin": "bun run build && install -m 755 ../dist/agent-usage ~/.local/bin/agent-usage && ln -sf agent-usage ~/.local/bin/usage-tracker"
+  }
+}
