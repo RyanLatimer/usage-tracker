@@ -24,7 +24,7 @@ import {
   type TextChunk,
   type ThemeMode,
 } from "@opentui/core"
-import { mkdirSync, existsSync, writeFileSync } from "node:fs"
+import { mkdirSync, existsSync, writeFileSync, readdirSync, statSync, rmSync } from "node:fs"
 import { homedir } from "node:os"
 import { join, resolve } from "node:path"
 import scriptSrc from "../usage_tracker.py" with { type: "text" }
@@ -50,14 +50,47 @@ type Report = { scope: string | null; harnesses: Record<string, Harness>; total:
 // Unpack the embedded python core (keyed by content hash so rebuilds refresh it).
 function unpackScript(): string {
   const cache = process.env.XDG_CACHE_HOME || join(homedir(), ".cache")
-  const dirPath = join(cache, "agent-usage", Bun.hash(scriptSrc + pricingSrc).toString(16))
+  const parent = join(cache, "agent-usage")
+  const dirPath = join(parent, Bun.hash(scriptSrc + pricingSrc).toString(16))
   const script = join(dirPath, "usage_tracker.py")
   if (!existsSync(script)) {
     mkdirSync(dirPath, { recursive: true })
     writeFileSync(join(dirPath, "pricing.json"), pricingSrc)
     writeFileSync(script, scriptSrc)
   }
+  pruneOldCaches(parent, dirPath)
   return script
+}
+
+// Remove stale unpacked hashes, keeping the latest 3 by mtime.
+function pruneOldCaches(parent: string, current: string, keep = 3): void {
+  try {
+    const entries = readdirSync(parent, { withFileTypes: true }).filter(
+      (d) => d.isDirectory() && /^[0-9a-f]+$/i.test(d.name),
+    )
+    if (entries.length <= keep) return
+    const dirs = entries.map((d) => {
+      const full = join(parent, d.name)
+      let mtime = 0
+      try {
+        mtime = statSync(full).mtimeMs
+      } catch {
+        mtime = 0
+      }
+      return { full, mtime }
+    })
+    dirs.sort((a, b) => b.mtime - a.mtime)
+    for (const { full } of dirs.slice(keep)) {
+      if (full === current) continue
+      try {
+        rmSync(full, { recursive: true, force: true })
+      } catch {
+        // best-effort: ignore locked / concurrent unpacks
+      }
+    }
+  } catch {
+    // cache dir missing or unreadable — nothing to prune
+  }
 }
 const SCRIPT = unpackScript()
 

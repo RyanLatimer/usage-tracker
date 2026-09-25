@@ -17,7 +17,8 @@ Supported harnesses (best-effort, missing stores are skipped):
   - cursor    (~/.config/Cursor / ~/.cursor)
   - aider     (./.aider* / ~/.aider*)
   - grok      (~/.grok, ~/.xai, ~/.config/grok)
-  - t3-code   (flows through opencode/codex stores; reported separately if found)
+  - copilot   (~/.config/github-copilot / ~/.copilot)
+  - t3-code   (flows through opencode/codex stores, counted there)
 
 Usage:
   python usage_tracker.py [--global] [--dir PATH] [--json]
@@ -89,7 +90,9 @@ def load_pricing(path: str | None) -> dict:
             try:
                 extra = json.loads(cand.read_text())
                 if isinstance(extra, dict):
-                    pricing.update(extra)
+                    for k, v in extra.items():
+                        if isinstance(v, dict):
+                            pricing[k] = v
             except Exception as e:
                 print(f"warning: could not read pricing file {cand}: {e}", file=sys.stderr)
             break
@@ -113,22 +116,28 @@ def _strip_free_suffix(model: str) -> str:
 
 
 def price_for(model: str, pricing: dict) -> dict | None:
-    if model in pricing:
-        return pricing[model]
+    val = pricing.get(model)
+    if isinstance(val, dict):
+        return val
     base = _strip_free_suffix(model)
-    if base != model and base in pricing:
-        return pricing[base]
+    if base != model:
+        val = pricing.get(base)
+        if isinstance(val, dict):
+            return val
     # Longest-key substring match so specific tiers win, e.g.
     # "muse-spark-1.3-contributor" beats "muse-spark-1.3" beats "muse-spark"
     # even though all three live under one models.dev canonical entry.
     # Match against the free-stripped id so `-free` variants price at the
-    # normal non-free API cost.
+    # normal non-free API cost. Only `key in model` (never `model in key`)
+    # so short ids like "c" stay unpriced instead of matching "claude" etc.
     low = base.lower()
     best: dict | None = None
     best_len = -1
     for key, val in pricing.items():
+        if not isinstance(val, dict) or not isinstance(key, str):
+            continue
         kl = key.lower()
-        if kl in low or low in kl:
+        if kl in low:
             if len(kl) > best_len:
                 best = val
                 best_len = len(kl)
@@ -163,6 +172,7 @@ class ModelStats:
     cost_usd: float = 0.0
     recorded_cost_usd: float = 0.0
     unpriced: bool = False
+    free_tier: bool = False
 
     def add(self, other: "ModelStats") -> None:
         self.sessions += other.sessions
@@ -175,6 +185,7 @@ class ModelStats:
         self.cost_usd += other.cost_usd
         self.recorded_cost_usd += other.recorded_cost_usd
         self.unpriced = self.unpriced or other.unpriced
+        self.free_tier = self.free_tier or other.free_tier
 
 
 @dataclass
@@ -186,6 +197,8 @@ class HarnessResult:
     note: str = ""
     out_of_scope: int = 0
     unattributed: int = 0
+    sub_sessions: int = 0
+    sub_messages: int = 0
 
     @property
     def total(self) -> ModelStats:
@@ -224,6 +237,10 @@ def in_scope(sess_dir: str | os.PathLike | None, scope: str | None) -> bool | No
     s = normalize_dir(sess_dir)
     if s is None:
         return None
+    if scope == "/":
+        # Root scope matches any absolute session dir
+        # (avoids scope+sep == '//' failing the prefix check below).
+        return True
     if s == scope:
         return True
     return s.startswith(scope + os.sep)
@@ -249,8 +266,13 @@ def collect_opencode(pricing: dict, scope: str | None) -> HarnessResult:
     if not db.exists():
         res.note = "no store found"
         return res
+    con = None
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        con.isolation_level = None
+        # Snapshot both SELECTs so a live writer can't change the DB
+        # between the session list and the message counts.
+        con.execute("BEGIN")
         cur = con.cursor()
         cur.execute(
             "SELECT id, model, cost, tokens_input, tokens_output,"
@@ -259,10 +281,21 @@ def collect_opencode(pricing: dict, scope: str | None) -> HarnessResult:
         sessions = cur.fetchall()
         cur.execute("SELECT session_id, COUNT(*) FROM message GROUP BY session_id")
         msg_counts = dict(cur.fetchall())
-        con.close()
+        con.execute("COMMIT")
     except Exception as e:
+        try:
+            if con is not None:
+                con.execute("ROLLBACK")
+        except Exception:
+            pass
         res.note = f"read error: {e}"
         return res
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
     for sid, raw_model, cost, ti, to, cr, cw, tr, directory in sessions:
         verdict = in_scope(directory, scope)
         if verdict is None:
@@ -283,6 +316,10 @@ def collect_opencode(pricing: dict, scope: str | None) -> HarnessResult:
         st.reasoning_tokens += tr or 0
         st.recorded_cost_usd += cost or 0.0
         est, priced = estimate_cost(model, ti or 0, to or 0, cr or 0, cw or 0, pricing)
+        # Free-tier ids (e.g. `-free` / `:free` suffix) are still priced at
+        # paid rates — flag for disclosure, cost calculation unchanged.
+        if priced and _strip_free_suffix(model) != model:
+            st.free_tier = True
         # Prefer recorded cost when pricing is free/unknown but a real charge exists.
         st.cost_usd += max(est, cost or 0.0) if not priced else est
         if not priced and not (cost or 0):
@@ -355,14 +392,14 @@ def collect_codex(pricing: dict, scope: str | None) -> HarnessResult:
             cw = int(last_total.get("cache_write_input_tokens", 0) or 0)
             out = int(last_total.get("output_tokens", 0) or 0)
             rs = int(last_total.get("reasoning_output_tokens", 0) or 0)
-            # input_tokens includes cached tokens; report fresh input separately
-            # so category columns sum without double counting.
-            st.input_tokens += max(inp - cached - cw, 0)
+            # OpenAI input_tokens includes cached subset; report and cost fresh input only.
+            fresh = max(inp - cached - cw, 0)
+            st.input_tokens += fresh
             st.cache_read += cached
             st.cache_write += cw
             st.output_tokens += out
             st.reasoning_tokens += rs
-            est, priced = estimate_cost(model, inp, out, cached, cw, pricing)
+            est, priced = estimate_cost(model, fresh, out, cached, cw, pricing)
             st.cost_usd += est
             if not priced:
                 st.unpriced = True
@@ -375,12 +412,17 @@ def decode_claude_slug(slug: str) -> str | None:
     """Best-effort decode of ~/.claude/projects/<slug> back to a path.
 
     Claude encodes an absolute path by replacing '/' with '-',
-    e.g. '-home-ryan-Projects-foo'. Ambiguous with real dashes but
-    good enough as a fallback when lines carry no cwd.
+    e.g. '-home-ryan-Projects-foo', with a literal '-' encoded as '--'.
+    LOSSY fallback only — prefer the per-line cwd counter; names containing
+    single dashes are ambiguous and may decode to the wrong directory.
     """
     if not slug or not slug.startswith("-"):
         return None
-    return "/" + slug[1:].replace("-", "/")
+    # Handle double-dash (literal dash) before single-dash -> '/'.
+    tmp = slug[1:].replace("--", "\x00")
+    tmp = tmp.replace("-", "/")
+    tmp = tmp.replace("\x00", "-")
+    return "/" + tmp
 
 
 def collect_claude(pricing: dict, scope: str | None) -> HarnessResult:
@@ -398,6 +440,7 @@ def collect_claude(pricing: dict, scope: str | None) -> HarnessResult:
         per_file: dict[str, ModelStats] = {}
         cwd_counter: collections.Counter = collections.Counter()
         messages = 0
+        is_subagent = "/subagents/" in str(path)
         # Claude Code logs one line per content block of an API response, each
         # repeating the response's usage. Keep the last usage per message id
         # (streamed lines can carry a growing output count) so a response is
@@ -416,7 +459,28 @@ def collect_claude(pricing: dict, scope: str | None) -> HarnessResult:
                         cwd_counter[cwd] += 1
                     msg = obj.get("message") or {}
                     role = msg.get("role")
-                    if role == "user" or (role == "assistant" and msg.get("id") not in seen_ids):
+                    if role == "user":
+                        # User lines include both real prompts and tool_result
+                        # echoes (tool output fed back to the model). Only count
+                        # lines with actual user content: skip when ALL content
+                        # blocks are tool_result (or tool_use_id-bearing
+                        # non-text/image blocks). cwd above is still counted.
+                        content = msg.get("content")
+                        if isinstance(content, list) and content and all(
+                            isinstance(b, dict)
+                            and (
+                                b.get("type") == "tool_result"
+                                or (
+                                    "tool_use_id" in b
+                                    and b.get("type") not in ("text", "image")
+                                )
+                            )
+                            for b in content
+                        ):
+                            pass
+                        else:
+                            messages += 1
+                    elif role == "assistant" and msg.get("id") not in seen_ids:
                         messages += 1
                     if role == "assistant" and msg.get("id"):
                         seen_ids.add(msg["id"])
@@ -448,7 +512,12 @@ def collect_claude(pricing: dict, scope: str | None) -> HarnessResult:
             res.out_of_scope += 1
             continue
         # attribute file's message count to its dominant model
+        # (tokens from subagent files are real API calls: keep them, but
+        # track the session/message split separately).
         dom = max(per_file, key=lambda k: per_file[k].input_tokens + per_file[k].output_tokens) if per_file else "claude"
+        if is_subagent:
+            res.sub_sessions += 1
+            res.sub_messages += messages
         for model, st in (per_file or {dom: ModelStats()}).items():
             dst = res.per_model.setdefault(model, ModelStats())
             dst.input_tokens += st.input_tokens
@@ -501,10 +570,12 @@ def collect_gemini(pricing: dict, scope: str | None) -> HarnessResult:
             di = int(u.get("input_tokens", 0) or 0)
             do = int(u.get("output_tokens", 0) or 0)
             dc = int(u.get("cached_content_token_count", 0) or u.get("cache_read", 0) or 0)
-            st.input_tokens += di
+            # Google input_tokens includes cached subset; report and cost fresh input only.
+            fresh_di = max(di - dc, 0)
+            st.input_tokens += fresh_di
             st.output_tokens += do
             st.cache_read += dc
-            fi += di
+            fi += fresh_di
             fo += do
             fr += dc
         est, priced = estimate_cost(model, fi, fo, fr, 0, pricing)
@@ -524,17 +595,30 @@ def collect_dir_based(name: str, paths: list[Path], pricing: dict) -> HarnessRes
     return res
 
 
-def collect_all(pricing: dict, scope: str | None) -> list[HarnessResult]:
-    results = [
-        collect_opencode(pricing, scope),
-        collect_codex(pricing, scope),
-        collect_claude(pricing, scope),
-        collect_gemini(pricing, scope),
-        collect_dir_based("cursor", [HOME / ".config" / "Cursor", HOME / ".cursor"], pricing),
-        collect_dir_based("aider", [HOME / ".aider", Path.cwd() / ".aider.chat.history.md"], pricing),
-        collect_dir_based("grok", [HOME / ".grok", HOME / ".xai", HOME / ".config" / "grok"], pricing),
-        collect_dir_based("copilot", [HOME / ".config" / "github-copilot", HOME / ".copilot"], pricing),
-    ]
+def collect_all(pricing: dict, scope: str | None, only: set[str] | None = None) -> list[HarnessResult]:
+    """Collect per-harness results, skipping unneeded collectors when `only` is set."""
+    wanted = {h.lower() for h in only} if only else None
+
+    def want(name: str) -> bool:
+        return wanted is None or name.lower() in wanted
+
+    results = []
+    if want("opencode"):
+        results.append(collect_opencode(pricing, scope))
+    if want("codex"):
+        results.append(collect_codex(pricing, scope))
+    if want("claude"):
+        results.append(collect_claude(pricing, scope))
+    if want("gemini"):
+        results.append(collect_gemini(pricing, scope))
+    if want("cursor"):
+        results.append(collect_dir_based("cursor", [HOME / ".config" / "Cursor", HOME / ".cursor"], pricing))
+    if want("aider"):
+        results.append(collect_dir_based("aider", [HOME / ".aider", Path.cwd() / ".aider.chat.history.md"], pricing))
+    if want("grok"):
+        results.append(collect_dir_based("grok", [HOME / ".grok", HOME / ".xai", HOME / ".config" / "grok"], pricing))
+    if want("copilot"):
+        results.append(collect_dir_based("copilot", [HOME / ".config" / "github-copilot", HOME / ".copilot"], pricing))
     return results
 
 
@@ -569,7 +653,12 @@ def render_text(results: list[HarnessResult], scope: str | None) -> str:
             if r.unattributed:
                 bits.append(f"{r.unattributed} unattributed (no dir recorded)")
         status = f"  [{'; '.join(bits)}]" if bits else ""
-        lines.append(f"\n[{r.harness}] {t.sessions} sessions, {t.messages} messages{status}")
+        if r.sub_sessions:
+            top = t.sessions - r.sub_sessions
+            sess_str = f"{t.sessions} sessions ({top} top-level + {r.sub_sessions} subagent)"
+        else:
+            sess_str = f"{t.sessions} sessions"
+        lines.append(f"\n[{r.harness}] {sess_str}, {t.messages} messages{status}")
         lines.append(f"  store: {r.store}")
         if not r.per_model:
             continue
@@ -599,6 +688,8 @@ def render_text(results: list[HarnessResult], scope: str | None) -> str:
         lines.append(f"  recorded : {fmt_cost(grand.recorded_cost_usd)} (sum of harness-reported cost fields)")
     if any(s.unpriced for r in results for s in r.per_model.values()):
         lines.append("  * unpriced model — pass --pricing pricing.json to set $/1M rates.")
+    if any(s.free_tier for r in results for s in r.per_model.values()):
+        lines.append("  † free-tier sessions priced at paid rates (actual charge may be $0).")
     # per-model rollup across harnesses
     rollup: dict[str, ModelStats] = {}
     for r in results:
@@ -633,7 +724,10 @@ def render_json(results: list[HarnessResult], scope: str | None) -> str:
             "sessions_out_of_scope": r.out_of_scope,
             "sessions_unattributed": r.unattributed,
             "sessions": t.sessions,
+            "top_level_sessions": t.sessions - r.sub_sessions,
+            "subagent_sessions": r.sub_sessions,
             "messages": t.messages,
+            "subagent_messages": r.sub_messages,
             "input_tokens": t.input_tokens,
             "output_tokens": t.output_tokens,
             "cache_read_tokens": t.cache_read,
@@ -653,6 +747,7 @@ def render_json(results: list[HarnessResult], scope: str | None) -> str:
                     "cost_usd": round(s.cost_usd, 4),
                     "recorded_cost_usd": round(s.recorded_cost_usd, 4),
                     "unpriced": s.unpriced,
+                    "free_tier": s.free_tier,
                 }
                 for m, s in r.per_model.items()
             },
@@ -678,6 +773,7 @@ def render_json(results: list[HarnessResult], scope: str | None) -> str:
             "cache_write_tokens": s.cache_write,
             "reasoning_tokens": s.reasoning_tokens,
             "cost_usd": round(s.cost_usd, 4),
+            "free_tier": s.free_tier,
         }
         for m, s in rollup.items()
     }
@@ -700,10 +796,12 @@ def main(argv: list[str] | None = None) -> int:
 
     scope = resolve_scope(args.dir, args.global_scope)
     pricing = load_pricing(args.pricing)
-    results = collect_all(pricing, scope)
+    # Parse --harness first so collect_all can skip unneeded collectors
+    # (e.g. --harness claude must not scan the 1.5GB opencode.db).
+    want: set[str] | None = None
     if args.harness:
         want = {h.strip().lower() for h in args.harness.split(",") if h.strip()}
-        results = [r for r in results if r.harness.lower() in want]
+    results = collect_all(pricing, scope, only=want)
 
     if args.json:
         print(render_json(results, scope))
