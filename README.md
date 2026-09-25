@@ -33,7 +33,34 @@ agent-usage
 agent-usage --json
 ```
 
-## TUI / binary
+## Install on another machine (macOS / Linux)
+
+Prebuilt binaries live under `release/` as versioned tarballs
+(`agent-usage-<version>-<os>-<arch>.tar.gz` + `SHA256SUMS.txt`),
+one per platform — including **macOS Apple Silicon (`darwin-arm64`)**
+and Intel (`darwin-x64`). The only runtime dependency is `python3`
+(stdlib only); on macOS install it with `brew install python`.
+
+```bash
+# on the Mac, from tarballs copied over (scp, AirDrop, USB…):
+bash install.sh --local ./release            # picks the right tarball
+bash install.sh --local agent-usage-0.1.0-darwin-arm64.tar.gz
+
+# once this repo is on GitHub (tag v* builds the tarballs via CI):
+curl -fsSL https://raw.githubusercontent.com/<you>/usage-tracker/main/install.sh | \
+  bash -s -- --repo <you>/usage-tracker
+```
+
+This installs `agent-usage` (plus a `usage-tracker` symlink) into
+`~/.local/bin`. If that isn't on your `PATH`, the installer tells you —
+on macOS add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc`.
+Verify with `agent-usage --version`.
+
+> First launch on macOS may show a Gatekeeper prompt (the binary isn't
+> notarized): right-click → Open, or
+> `xattr -d com.apple.quarantine ~/.local/bin/agent-usage`.
+
+## TUI / binary (building from source)
 
 `agent-usage` (alias `usage-tracker`) is a standalone [Bun](https://bun.sh)
 binary: an interactive [OpenTUI](https://opentui.com) dashboard over the
@@ -42,7 +69,7 @@ and unpacked to `~/.cache/agent-usage/<hash>/`; the python core stays stdlib-onl
 
 ```bash
 cd /home/ryan/Projects/usage-tracker/tui
-bun install            # once
+bun run setup          # once: deps incl. macOS cross-compile bits
 bun run install-bin    # build dist/agent-usage → ~/.local/bin/agent-usage (+ usage-tracker symlink)
 
 agent-usage                    # TUI, scoped to cwd
@@ -51,6 +78,16 @@ agent-usage --json             # old CLI output (also --plain, --help, or when p
 ```
 
 Re-run `bun run install-bin` after editing `usage_tracker.py` or `pricing.json`.
+
+Cross-compile for other machines (from Linux, no Mac needed):
+
+```bash
+bun run build:mac        # Apple Silicon → dist/agent-usage-darwin-arm64
+bun run build:mac-intel  # Intel Mac     → dist/agent-usage-darwin-x64
+bun run build:all        # + linux-x64, linux-arm64
+bun run dist:mac         # mac builds → release/*.tar.gz + SHA256SUMS.txt
+bun run dist             # all platforms → release/
+```
 
 Keys: `↑/↓` pick harness · `g` toggle global / directory scope · `t` toggle
 light/dark · `r` refresh · `q` quit.

@@ -38,6 +38,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+__version__ = "0.1.0"
+
 HOME = Path.home()
 
 # ---------------------------------------------------------------- pricing
@@ -930,6 +932,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dir", default=None, help="scope to this directory incl. subdirectories (default: current directory)")
     ap.add_argument("--global", "--all", dest="global_scope", action="store_true",
                     help="no directory scoping: count sessions in all directories")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = ap.parse_args(argv)
     if args.global_scope and args.dir:
         ap.error("--global cannot be combined with --dir")

@@ -1,0 +1,26 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            targets: "linux-x64 linux-arm64 darwin-arm64 darwin-x64"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun run setup
+        working-directory: tui
+      - run: bun run build:all
+        working-directory: tui
+      - run: ./scripts/dist.sh
+        working-directory: tui
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*

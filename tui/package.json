@@ -12,8 +12,21 @@
   "dependencies": {
     "@opentui/core": "^0.5.12"
   },
+  "optionalDependencies": {
+    "@opentui/core-darwin-arm64": "^0.5.12",
+    "@opentui/core-darwin-x64": "^0.5.12",
+    "@opentui/core-linux-arm64": "^0.5.12"
+  },
   "scripts": {
+    "setup": "bun install --os='*' --cpu='*'",
     "build": "bun build --compile ./index.ts --outfile ../dist/agent-usage",
+    "build:linux-x64": "bun build --compile --target=bun-linux-x64 ./index.ts --outfile ../dist/agent-usage-linux-x64",
+    "build:linux-arm64": "bun build --compile --target=bun-linux-arm64 ./index.ts --outfile ../dist/agent-usage-linux-arm64",
+    "build:mac": "bun build --compile --target=bun-darwin-arm64 ./index.ts --outfile ../dist/agent-usage-darwin-arm64",
+    "build:mac-intel": "bun build --compile --target=bun-darwin-x64 ./index.ts --outfile ../dist/agent-usage-darwin-x64",
+    "build:all": "bun run build:linux-x64 && bun run build:linux-arm64 && bun run build:mac && bun run build:mac-intel",
+    "dist": "bun run build:all && ./scripts/dist.sh",
+    "dist:mac": "bun run build:mac && bun run build:mac-intel && ./scripts/dist.sh",
     "install-bin": "bun run build && install -m 755 ../dist/agent-usage ~/.local/bin/agent-usage && ln -sf agent-usage ~/.local/bin/usage-tracker"
   }
 }

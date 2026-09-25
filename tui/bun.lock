@@ -10,6 +10,11 @@
       "devDependencies": {
         "@types/bun": "latest",
       },
+      "optionalDependencies": {
+        "@opentui/core-darwin-arm64": "^0.5.12",
+        "@opentui/core-darwin-x64": "^0.5.12",
+        "@opentui/core-linux-arm64": "^0.5.12",
+      },
       "peerDependencies": {
         "typescript": "^7",
       },

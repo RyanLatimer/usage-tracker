@@ -1,0 +1,7 @@
+# built binaries + packaged releases (reproduce with: cd tui && bun run dist)
+dist/
+release/
+.tmp-dist/
+# python cache
+__pycache__/
+*.pyc

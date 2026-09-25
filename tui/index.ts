@@ -96,10 +96,18 @@ const SCRIPT = unpackScript()
 
 const argv = process.argv.slice(2)
 
-// Old CLI behaviour: --json / --plain / --help, or piped output, go straight to python.
-if (argv.some((a) => ["--json", "--plain", "-h", "--help"].includes(a)) || !process.stdout.isTTY) {
+const PY_MISSING = "agent-usage: python3 not found — install Python 3.9+ (macOS: brew install python)."
+
+// Old CLI behaviour: --json / --plain / --version / --help, or piped output, go straight to python.
+if (argv.some((a) => ["--json", "--plain", "--version", "-h", "--help"].includes(a)) || !process.stdout.isTTY) {
   const args = argv.filter((a) => !["--plain", "--light", "--dark"].includes(a))
-  const proc = Bun.spawn(["python3", SCRIPT, ...args], { stdio: ["inherit", "inherit", "inherit"] })
+  let proc
+  try {
+    proc = Bun.spawn(["python3", SCRIPT, ...args], { stdio: ["inherit", "inherit", "inherit"] })
+  } catch {
+    console.error(PY_MISSING)
+    process.exit(1)
+  }
   const code = await proc.exited
   if (argv.includes("-h") || argv.includes("--help")) {
     console.log(`
@@ -124,7 +132,12 @@ async function load(): Promise<Report> {
   const args = ["python3", SCRIPT, "--json", ...(globalScope ? ["--global"] : ["--dir", dir])]
   if (pricing) args.push("--pricing", pricing)
   if (harness) args.push("--harness", harness)
-  const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" })
+  let proc
+  try {
+    proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" })
+  } catch {
+    throw new Error("python3 not found — install Python 3.9+ (macOS: brew install python)")
+  }
   const [out, err, code] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
