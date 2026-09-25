@@ -260,6 +260,59 @@ def parse_opencode_model(raw: str) -> str:
         return raw or "unknown"
 
 
+def parse_opencode_msg_model(data: str | None, fallback: str) -> str:
+    """Model id recorded on an opencode `message` row.
+
+    Sessions can switch models mid-conversation (e.g. via T3), so the
+    session-level `model` column goes stale — per-message ids are the
+    ground truth. Handles the `{"model": {"providerID", "modelID"}}`
+    shape plus legacy `modelID` / `info.modelID` variants.
+    """
+    try:
+        d = json.loads(data) if data else {}
+    except Exception:
+        return fallback
+    if not isinstance(d, dict):
+        return fallback
+    m = d.get("model")
+    if isinstance(m, dict):
+        mid = m.get("modelID", "unknown") or "unknown"
+        pid = m.get("providerID", "") or ""
+        if pid and pid not in mid:
+            return f"{pid}/{mid}"
+        return mid
+    for container in (d, d.get("info") if isinstance(d.get("info"), dict) else {}):
+        mid = container.get("modelID")
+        if mid:
+            pid = container.get("providerID", "") or ""
+            if pid and pid not in mid:
+                return f"{pid}/{mid}"
+            return mid
+    return fallback
+
+
+def parse_opencode_step_tokens(data: str | None) -> tuple[int, int, int, int, int] | None:
+    """(input, output, cache_read, cache_write, reasoning) for step-finish parts."""
+    try:
+        d = json.loads(data) if data else {}
+    except Exception:
+        return None
+    if not isinstance(d, dict) or d.get("type") != "step-finish":
+        return None
+    t = d.get("tokens", {}) or {}
+    c = t.get("cache", {}) or {}
+    try:
+        return (
+            int(t.get("input", 0) or 0),
+            int(t.get("output", 0) or 0),
+            int(c.get("read", 0) or 0),
+            int(c.get("write", 0) or 0),
+            int(t.get("reasoning", 0) or 0),
+        )
+    except Exception:
+        return None
+
+
 def collect_opencode(pricing: dict, scope: str | None) -> HarnessResult:
     db = HOME / ".local" / "share" / "opencode" / "opencode.db"
     res = HarnessResult("opencode", str(db), found=db.exists())
@@ -281,6 +334,19 @@ def collect_opencode(pricing: dict, scope: str | None) -> HarnessResult:
         sessions = cur.fetchall()
         cur.execute("SELECT session_id, COUNT(*) FROM message GROUP BY session_id")
         msg_counts = dict(cur.fetchall())
+        # Per-message model ids: sessions can switch models mid-conversation
+        # (e.g. via T3), leaving session.model stale. Best effort — any
+        # failure falls back to session-level attribution below.
+        try:
+            cur.execute("SELECT id, session_id, data FROM message")
+            msg_rows = cur.fetchall()
+        except Exception:
+            msg_rows = []
+        try:
+            cur.execute("SELECT session_id, message_id, data FROM part")
+            part_rows = cur.fetchall()
+        except Exception:
+            part_rows = []
         con.execute("COMMIT")
     except Exception as e:
         try:
@@ -296,6 +362,35 @@ def collect_opencode(pricing: dict, scope: str | None) -> HarnessResult:
                 con.close()
             except Exception:
                 pass
+    # Precompute per-session model attribution in single passes.
+    sess_model_of: dict[str, str] = {}
+    for sid, raw_model, *_ in sessions:
+        sess_model_of[sid] = parse_opencode_model(raw_model or "")
+    # sid -> {model -> message count}
+    sess_msgs: dict[str, dict[str, int]] = {}
+    # message_id -> (session_id, model)
+    msg_info: dict[str, tuple[str, str]] = {}
+    for mid, msid, mdata in msg_rows:
+        model = parse_opencode_msg_model(mdata, sess_model_of.get(msid, "unknown"))
+        msg_info[mid] = (msid, model)
+        if msid in sess_model_of:
+            bucket = sess_msgs.setdefault(msid, {})
+            bucket[model] = bucket.get(model, 0) + 1
+    # sid -> {model -> [input, output, cache_read, cache_write, reasoning]}
+    # weights from step-finish parts, used to split session-level totals.
+    sess_weights: dict[str, dict[str, list[int]]] = {}
+    for psid, pmid, pdata in part_rows:
+        toks = parse_opencode_step_tokens(pdata)
+        if toks is None or psid not in sess_model_of:
+            continue
+        info = msg_info.get(pmid)
+        if info is not None and info[0] == psid:
+            model = info[1]
+        else:
+            model = sess_model_of[psid]
+        bucket = sess_weights.setdefault(psid, {}).setdefault(model, [0, 0, 0, 0, 0])
+        for i, v in enumerate(toks):
+            bucket[i] += v
     for sid, raw_model, cost, ti, to, cr, cw, tr, directory in sessions:
         verdict = in_scope(directory, scope)
         if verdict is None:
@@ -305,25 +400,70 @@ def collect_opencode(pricing: dict, scope: str | None) -> HarnessResult:
         elif not verdict:
             res.out_of_scope += 1
             continue
-        model = parse_opencode_model(raw_model or "")
-        st = res.per_model.setdefault(model, ModelStats())
-        st.sessions += 1
-        st.messages += msg_counts.get(sid, 0)
-        st.input_tokens += ti or 0
-        st.output_tokens += to or 0
-        st.cache_read += cr or 0
-        st.cache_write += cw or 0
-        st.reasoning_tokens += tr or 0
-        st.recorded_cost_usd += cost or 0.0
-        est, priced = estimate_cost(model, ti or 0, to or 0, cr or 0, cw or 0, pricing)
-        # Free-tier ids (e.g. `-free` / `:free` suffix) are still priced at
-        # paid rates — flag for disclosure, cost calculation unchanged.
-        if priced and _strip_free_suffix(model) != model:
-            st.free_tier = True
-        # Prefer recorded cost when pricing is free/unknown but a real charge exists.
-        st.cost_usd += max(est, cost or 0.0) if not priced else est
-        if not priced and not (cost or 0):
-            st.unpriced = True
+        sess_model = sess_model_of[sid]
+        per_msg = sess_msgs.get(sid, {})
+        per_w = {m: w for m, w in sess_weights.get(sid, {}).items() if any(w)}
+        if per_w:
+            # Split session-level totals by part-token weight so nothing is
+            # lost (session columns may include compaction/summary extras).
+            tot_w = sum(sum(w[:4]) for w in per_w.values())
+            if tot_w <= 0:  # weights carry reasoning only
+                tot_w = sum(w[4] for w in per_w.values()) or 1
+                frac = {m: (sum(w[:4]) or w[4]) / tot_w for m, w in per_w.items()}
+            else:
+                frac = {m: sum(w[:4]) / tot_w for m, w in per_w.items()}
+            models_here = set(per_w) | set(per_msg)
+        elif per_msg:
+            # No usable part data — split by message counts.
+            tot_m = sum(per_msg.values()) or 1
+            frac = {m: c / tot_m for m, c in per_msg.items()}
+            models_here = set(per_msg)
+        else:
+            frac = {sess_model: 1.0}
+            models_here = {sess_model}
+        # Session counts to the dominant model; messages counted per model.
+        # The dominant model's share is the remainder so session-level token
+        # totals are preserved exactly.
+        dom = max(models_here, key=lambda m: (frac.get(m, 0), m == sess_model))
+        others = [m for m in models_here if m != dom]
+        totals = (ti or 0, to or 0, cr or 0, cw or 0, tr or 0)
+        shares: dict[str, tuple[int, int, int, int, int]] = {}
+        used = [0, 0, 0, 0, 0]
+        for model in others:
+            f = frac.get(model, 0.0)
+            share = tuple(round(v * f) for v in totals)
+            shares[model] = share
+            for i, v in enumerate(share):
+                used[i] += v
+        shares[dom] = tuple(v - u for v, u in zip(totals, used))
+        for model in models_here:
+            si, so, scr, scw, sr = shares[model]
+            st = res.per_model.setdefault(model, ModelStats())
+            if model == dom:
+                st.sessions += 1
+            st.messages += per_msg.get(model, 0) if per_msg else (
+                msg_counts.get(sid, 0) if model == dom else 0
+            )
+            st.input_tokens += si
+            st.output_tokens += so
+            st.cache_read += scr
+            st.cache_write += scw
+            st.reasoning_tokens += sr
+            # Split recorded cost by token share (shares sum to session totals).
+            tot4 = totals[0] + totals[1] + totals[2] + totals[3]
+            rec_share = (cost or 0.0) * (
+                (si + so + scr + scw) / tot4 if tot4 else (1.0 if model == dom else 0.0)
+            )
+            st.recorded_cost_usd += rec_share
+            est, priced = estimate_cost(model, si, so, scr, scw, pricing)
+            # Free-tier ids (e.g. `-free` / `:free` suffix) are still priced at
+            # paid rates — flag for disclosure, cost calculation unchanged.
+            if priced and _strip_free_suffix(model) != model:
+                st.free_tier = True
+            # Prefer recorded cost when pricing is free/unknown but a real charge exists.
+            st.cost_usd += max(est, rec_share) if not priced else est
+            if not priced and not (cost or 0):
+                st.unpriced = True
     return res
 
 
