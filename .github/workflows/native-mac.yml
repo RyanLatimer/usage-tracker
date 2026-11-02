@@ -1,0 +1,70 @@
+name: native-mac
+on:
+  push:
+    branches: [main, master]
+    paths: ["native/**", "usage_tracker.py", "pricing.json", ".github/workflows/native-mac.yml"]
+    tags: ["native-v*", "v*"]
+  pull_request:
+    paths: ["native/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            arch: darwin-arm64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            arch: darwin-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build release binary
+        working-directory: native
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Pack .app
+        run: |
+          VERSION="${GITHUB_REF_NAME#native-v}"
+          VERSION="${VERSION#v}"
+          [ -z "$VERSION" ] || [[ "$VERSION" == *"heads"* ]] && VERSION="0.1.0"
+          ./native/pack-mac.sh \
+            "native/target/${{ matrix.target }}/release/agent-usage-rune" \
+            dist \
+            "Agent Usage" \
+            "com.local.agent-usage-rune" \
+            "$VERSION"
+          cd dist && zip -r -y "AgentUsage-${{ matrix.arch }}.zip" "AgentUsage.app"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AgentUsage-${{ matrix.arch }}
+          path: dist/AgentUsage-${{ matrix.arch }}.zip
+      - name: Smoke test (headless snap)
+        run: |
+          BIN="native/target/${{ matrix.target }}/release/agent-usage-rune"
+          "$BIN" --help 2>&1 | head -n 20 || true
+          # headless render of the default + empty scenes (no GPU-required windowing on CI)
+          "$BIN" --snap /tmp/agent-usage.png --scene default --theme dark --size 980x660 || true
+          ls -la /tmp/agent-usage.png || true
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip

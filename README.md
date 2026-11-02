@@ -79,6 +79,36 @@ agent-usage --json             # old CLI output (also --plain, --help, or when p
 
 Re-run `bun run install-bin` after editing `usage_tracker.py` or `pricing.json`.
 
+## Native Rune app (macOS .app)
+
+`native/` is a native Rust UI built with the
+[Rune](https://github.com/anomalyco/rune) graphics library (`dev` rev
+`e12e3e4`), styled with Rune's design system: unbranded core tokens +
+the OpenCode theme (`rune-theme-opencode`, Inter + IBM Plex Mono, light/dark)
+as the reference theme — same look on every platform, not native macOS chrome.
+
+The app embeds `usage_tracker.py` + `pricing.json` at compile time and shells
+to `python3` at runtime (same as the TUI), so macOS needs `brew install python`.
+
+```bash
+cd native
+cargo check          # type-check (Linux needs libxkbcommon-dev to link/test)
+cargo run            # run windowed (needs display + GPU)
+./pack-mac.sh target/release/agent-usage-rune dist  # local .app (on Mac)
+```
+
+Keys: `g` toggle global/dir scope · `r` refresh · `t` theme (Auto/Light/Dark).
+Buttons for the same actions are in the header.
+
+GitHub Actions (`.github/workflows/native-mac.yml`) builds on every push to
+`main` touching `native/**`:
+- `macos-14` → `AgentUsage-darwin-arm64.zip` (Apple Silicon)
+- `macos-13` → `AgentUsage-darwin-x64.zip` (Intel Mac)
+
+Each zip contains `AgentUsage.app` (ad-hoc signed, not notarized —
+first launch: right-click → Open). Tagged pushes (`v*` / `native-v*`)
+attach both zips to the GitHub Release.
+
 Cross-compile for other machines (from Linux, no Mac needed):
 
 ```bash

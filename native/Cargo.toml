@@ -1,0 +1,17 @@
+[package]
+name = "agent-usage-rune"
+version = "0.1.0"
+edition = "2021"
+description = "Native Rune UI for agent-usage (sessions, tokens, cost per harness/model)"
+license = "MIT"
+
+[[bin]]
+name = "agent-usage-rune"
+path = "src/main.rs"
+
+[dependencies]
+rune = { git = "https://github.com/anomalyco/rune", rev = "e12e3e4dca19513f80b4e50dd83f35d396f936b8" }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "e12e3e4dca19513f80b4e50dd83f35d396f936b8" }
+rune-theme-opencode = { git = "https://github.com/anomalyco/rune", rev = "e12e3e4dca19513f80b4e50dd83f35d396f936b8", package = "rune-theme-opencode" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
