@@ -57,9 +57,9 @@ jobs:
           "$BIN" --scene demo --theme dark --script native/scripts/filter.json --tree screenshots/filtered.json --snap screenshots/filtered.png --size 900x620
           python3 - <<'PYTEST'
           import json
-          elements = {e['key']: e for e in json.load(open('screenshots/filtered.json'))['elements']}
+          elements = {e['key']: e for e in json.load(open('screenshots/filtered.json'))['elements'] if 'key' in e}
           assert elements['title']['text'] == 'Claude Code'
-          assert elements['models-count']['text'] == '1'
+          assert any(e.get('text') == 'claude-opus-4-6' for e in elements.values())
           assert elements['spend-value']['text'] == '$4.06'
           PYTEST
       - uses: actions/upload-artifact@v4

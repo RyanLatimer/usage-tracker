@@ -86,7 +86,10 @@ Re-run `bun run install-bin` after editing `usage_tracker.py` or `pricing.json`.
 `e12e3e4`), using the OpenCode theme's neutral surfaces, blue accent,
 Inter typography, and light/dark appearances. The dashboard includes a source
 sidebar, date filters, daily cost bars, token totals, source cost shares, and
-an uncapped, scrollable model breakdown. Refreshes scan in the background.
+an uncapped, scrollable model breakdown. Buttons, segmented date controls,
+source lists, badges and dividers use Rune Kit's `@opencode/ui` ports with
+`rune-theme-opencode`. Refreshes scan in the background. Chart methodology
+and daily values are available on hover.
 
 Date filters use UTC session start dates for OpenCode, Codex, Claude Code,
 and Gemini. Undated sessions remain in All time; daily costs are attributed

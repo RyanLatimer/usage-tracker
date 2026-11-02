@@ -4,6 +4,9 @@ use std::process::Command;
 
 use rune::{col, el, row, text, AppSpec, Cx, El};
 use rune::{Color, ScrollSpec, TextStyle};
+use rune_kit::{
+    Badge, Button, ButtonVariant, ControlSize, Divider, Kit, List, ListItem, SegmentedControl,
+};
 
 // ---------------------------------------------------------------- data
 
@@ -279,6 +282,7 @@ fn ink(hex: &str) -> Color {
 
 #[derive(Clone, Copy)]
 struct Theme {
+    kit: &'static Kit,
     page: Color,
     sidebar: Color,
     panel: Color,
@@ -287,12 +291,12 @@ struct Theme {
     muted: Color,
     faint: Color,
     accent: Color,
-    wash: Color,
 }
 impl Theme {
     fn new(dark: bool) -> Self {
         let k = rune_theme_opencode::kit(dark);
         Self {
+            kit: k,
             page: k.c.page,
             sidebar: k.c.bg_base,
             panel: k.c.layer_01,
@@ -301,7 +305,6 @@ impl Theme {
             muted: k.c.text_muted,
             faint: k.c.text_faint,
             accent: k.c.text_accent,
-            wash: k.c.layer_01.mix(k.c.text_accent, 0.07),
         }
     }
 }
@@ -312,7 +315,7 @@ fn label(key: &str, value: impl Into<String>, size: f32, weight: f32, color: Col
         .color(color)
 }
 fn rule(key: &str, t: Theme) -> El {
-    el().key(key).w_full().h(1.0).fill(t.line)
+    Divider::horizontal().build(t.kit).key(key)
 }
 fn dot(key: &str, color: Color) -> El {
     el().key(key).size(7.0, 7.0).radius(4.0).fill(color)
@@ -380,15 +383,14 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
         .px(18.0)
         .center_y()
         .window_drag()
-        .child(el().key("traffic-space").w(cx.titlebar_inset().max(78.0)))
-        .child(label("window-title", "AGENT USAGE", 10.0, 600.0, t.faint));
+        .child(el().key("traffic-space").w(cx.titlebar_inset().max(78.0)));
     let content = col()
         .key("content")
         .grow(1.0)
         .min_w(0.0)
         .min_h(0.0)
-        .padding(28.0)
-        .gap(24.0)
+        .padding(24.0)
+        .gap(20.0)
         .scroll(ScrollSpec {
             stick_bottom: false,
         })
@@ -399,7 +401,7 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
         .child(token_totals(s, t))
         .child(allocation(s, t))
         .child(model_table(s, t));
-    col()
+    let body = col()
         .key("window")
         .w_full()
         .h_full()
@@ -413,24 +415,19 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
                 .min_h(0.0)
                 .child(sidebar(s, t))
                 .child(content),
-        )
+        );
+    rune_kit::root(body, Vec::<El>::new())
 }
 fn action(key: &str, title: &str, t: Theme, f: impl Fn(&mut State) + 'static) -> El {
-    el().key(key)
-        .role("button")
-        .h(30.0)
-        .px(11.0)
-        .center()
-        .radius(7.0)
-        .border(1.0, t.line)
-        .fill(t.panel)
-        .hover(t.wash)
+    Button::new(title)
+        .control_size(ControlSize::Large)
         .on_press(f)
-        .child(label(&format!("{key}-label"), title, 11.0, 500.0, t.muted))
+        .build(t.kit)
+        .key(key)
 }
 fn header(s: &State, t: Theme) -> El {
     let title = if s.selected == "*" {
-        "Overview".into()
+        "Usage".into()
     } else {
         source_name(&s.selected)
     };
@@ -446,14 +443,7 @@ fn header(s: &State, t: Theme) -> El {
                 .gap(6.0)
                 .grow(1.0)
                 .min_w(0.0)
-                .child(label("title", title, 27.0, 600.0, t.text))
-                .child(label(
-                    "subtitle",
-                    "A little clarity on your AI spend.",
-                    12.0,
-                    400.0,
-                    t.muted,
-                )),
+                .child(label("title", title, 22.0, 600.0, t.text)),
         )
         .child(
             row()
@@ -485,64 +475,48 @@ fn header(s: &State, t: Theme) -> El {
         )
 }
 fn sidebar(s: &State, t: Theme) -> El {
-    let mut nav = col().key("source-list").gap(5.0).child(nav_item(
-        "*",
-        "All sources",
-        s.report.total.sessions,
-        s.selected == "*",
-        t,
-    ));
-    let mut names: Vec<_> = s.report.harnesses.iter().collect();
-    names.sort_by(|a, b| b.1.cost_usd.total_cmp(&a.1.cost_usd).then(a.0.cmp(b.0)));
-    for (name, h) in &names {
-        if h.found || h.sessions > 0 {
-            nav = nav.child(nav_item(
-                name,
-                &source_name(name),
-                h.sessions,
-                s.selected == **name,
-                t,
-            ));
-        }
+    let mut choices = vec![("*".to_string(), "All sources".to_string())];
+    let mut names: Vec<_> = s
+        .report
+        .harnesses
+        .iter()
+        .filter(|(_, h)| h.found || h.sessions > 0)
+        .collect();
+    names.sort_by(|a, b| a.0.cmp(b.0));
+    choices.extend(
+        names
+            .into_iter()
+            .map(|(name, _)| (name.clone(), source_name(name))),
+    );
+    let active = choices.iter().position(|(key, _)| *key == s.selected);
+    let mut nav = List::new().active(active);
+    for (key, title) in choices {
+        nav = nav.item(
+            ListItem::new(title)
+                .selected(key == s.selected)
+                .on_select(move |s: &mut State, _| s.selected = key.clone()),
+        );
     }
     let theme = match s.appearance {
-        1 => "Appearance: Light",
-        2 => "Appearance: Dark",
-        _ => "Appearance: System",
-    };
-    let status = if s.error.is_some() {
-        "Could not refresh"
-    } else {
-        if s.pending.is_some() {
-            "Scanning local data…"
-        } else {
-            "Local data · on device"
-        }
+        1 => "Light",
+        2 => "Dark",
+        _ => "System",
     };
     col()
         .key("sidebar")
-        .w(198.0)
+        .w(184.0)
         .h_full()
         .fill(t.sidebar)
-        .padding(16.0)
-        .gap(20.0)
+        .padding(14.0)
+        .gap(16.0)
         .child(
-            row()
-                .key("brand")
-                .center_y()
-                .gap(10.0)
-                .py(10.0)
-                .child(
-                    el().key("brand-icon")
-                        .size(28.0, 28.0)
-                        .radius(8.0)
-                        .fill(t.accent)
-                        .center()
-                        .child(label("brand-glyph", "a", 22.0, 600.0, t.page)),
-                )
-                .child(label("brand-name", "Agent Usage", 14.0, 600.0, t.text)),
+            text("Sources")
+                .key("sources-title")
+                .font(t.kit.ty.small_medium)
+                .color(t.muted)
+                .px(8.0)
+                .py(8.0),
         )
-        .child(label("nav-caption", "WORKSPACE", 9.0, 600.0, t.faint))
         .child(
             col()
                 .key("nav-scroll")
@@ -551,73 +525,16 @@ fn sidebar(s: &State, t: Theme) -> El {
                 .scroll(ScrollSpec {
                     stick_bottom: false,
                 })
-                .child(nav),
+                .child(nav.build(t.kit).key("source-list")),
         )
         .child(
-            col()
-                .key("sidebar-bottom")
-                .gap(12.0)
-                .child(rule("sidebar-rule", t))
-                .child(action("theme-btn", theme, t, |s| {
-                    s.appearance = (s.appearance + 1) % 3
-                }))
-                .child(
-                    row()
-                        .key("local-status")
-                        .gap(7.0)
-                        .center_y()
-                        .child(dot(
-                            "status-dot",
-                            if s.error.is_some() {
-                                ink("#E6B294")
-                            } else {
-                                t.accent
-                            },
-                        ))
-                        .child(label("local-label", status, 10.0, 400.0, t.muted)),
-                ),
+            Button::new(theme)
+                .variant(ButtonVariant::GhostMuted)
+                .help("Appearance · T")
+                .on_press(|s: &mut State| s.appearance = (s.appearance + 1) % 3)
+                .build(t.kit)
+                .key("theme-btn"),
         )
-}
-fn nav_item(value: &str, title: &str, count: u64, selected: bool, t: Theme) -> El {
-    let id = format!("source-{value}");
-    let choice = value.to_string();
-    row()
-        .key(&id)
-        .w_full()
-        .h(38.0)
-        .px(10.0)
-        .gap(9.0)
-        .center_y()
-        .radius(7.0)
-        .role("button")
-        .fill(if selected { t.wash } else { Color::TRANSPARENT })
-        .hover(t.wash)
-        .on_press(move |s: &mut State| s.selected = choice.clone())
-        .child(dot(
-            &format!("{id}-dot"),
-            if value == "*" {
-                t.accent
-            } else {
-                source_color(value)
-            },
-        ))
-        .child(
-            label(
-                &format!("{id}-name"),
-                title,
-                11.0,
-                if selected { 600.0 } else { 400.0 },
-                if selected { t.accent } else { t.muted },
-            )
-            .grow(1.0),
-        )
-        .child(label(
-            &format!("{id}-count"),
-            count.to_string(),
-            10.0,
-            400.0,
-            t.faint,
-        ))
 }
 fn summary(s: &State, t: Theme) -> El {
     let st = selected_stats(s);
@@ -626,13 +543,15 @@ fn summary(s: &State, t: Theme) -> El {
         .key("spend")
         .grow(1.15)
         .min_w(0.0)
-        .padding(22.0)
-        .gap(12.0)
-        .radius(12.0)
-        .fill(t.wash)
+        .padding(18.0)
+        .gap(8.0)
+        .radius(t.kit.radius.md)
+        .fill(t.panel)
+        .border(1.0, t.line)
+        .help("Estimated API cost; includes cached tokens")
         .child(label(
             "spend-label",
-            "TOTAL API COST",
+            "API cost (est.)",
             10.0,
             600.0,
             t.accent,
@@ -643,21 +562,6 @@ fn summary(s: &State, t: Theme) -> El {
             42.0,
             500.0,
             t.text,
-        ))
-        .child(label(
-            "spend-note",
-            format!(
-                "Across {} models · {}",
-                models(s).len(),
-                if s.range_days == 0 {
-                    "all time".to_string()
-                } else {
-                    format!("{} days", s.range_days)
-                }
-            ),
-            11.0,
-            400.0,
-            t.muted,
         ));
     if let Some(e) = &s.error {
         hero = hero.child(label("error", e, 11.0, 400.0, ink("#D59A7A")).max_lines(3));
@@ -672,9 +576,9 @@ fn summary(s: &State, t: Theme) -> El {
             .key("metrics")
             .grow(1.0)
             .min_w(0.0)
-            .padding(22.0)
-            .gap(16.0)
-            .radius(12.0)
+            .padding(18.0)
+            .gap(12.0)
+            .radius(t.kit.radius.md)
             .fill(t.panel)
             .border(1.0, t.line)
             .child(
@@ -689,7 +593,7 @@ fn summary(s: &State, t: Theme) -> El {
                 row()
                     .key("metric-bottom")
                     .gap(20.0)
-                    .child(metric("tokens", "Total tokens", compact(tokens), t))
+                    .child(metric("tokens", "Tokens", compact(tokens), t))
                     .child(metric("average", "Cost / session", money(avg), t)),
             ),
     )
@@ -794,13 +698,6 @@ fn allocation(s: &State, t: Theme) -> El {
                     12.0,
                     500.0,
                     t.text,
-                ))
-                .child(label(
-                    "allocation-unit",
-                    "SHARE OF TOTAL COST",
-                    9.0,
-                    500.0,
-                    t.faint,
                 )),
         )
         .child(bar)
@@ -840,7 +737,7 @@ fn model_table(s: &State, t: Theme) -> El {
             row()
                 .key(&id)
                 .w_full()
-                .h(58.0)
+                .h(48.0)
                 .px(16.0)
                 .gap(12.0)
                 .center_y()
@@ -864,20 +761,14 @@ fn model_table(s: &State, t: Theme) -> El {
                         .child(
                             label(&format!("{id}-name"), model, 12.0, 500.0, t.text).max_lines(1),
                         )
-                        .child(
-                            label(
-                                &format!("{id}-provider"),
-                                if provider.is_empty() {
-                                    "Direct"
-                                } else {
-                                    provider
-                                },
-                                10.0,
-                                400.0,
-                                t.faint,
-                            )
-                            .max_lines(1),
-                        ),
+                        .children(if provider.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![
+                                label(&format!("{id}-provider"), provider, 10.0, 400.0, t.faint)
+                                    .max_lines(1),
+                            ]
+                        }),
                 )
                 .child(
                     label(
@@ -925,26 +816,13 @@ fn model_table(s: &State, t: Theme) -> El {
         );
     }
     if rows.is_empty() {
-        list = list.child(
-            col()
-                .key("empty-state")
-                .padding(30.0)
-                .gap(8.0)
-                .child(label(
-                    "empty-title",
-                    "Nothing here yet",
-                    16.0,
-                    500.0,
-                    t.text,
-                ))
-                .child(label(
-                    "empty-description",
-                    "Your models will appear after a recorded session. Refresh to check again.",
-                    12.0,
-                    400.0,
-                    t.muted,
-                )),
-        );
+        list = list.child(col().key("empty-state").padding(30.0).gap(8.0).child(label(
+            "empty-title",
+            "No usage",
+            16.0,
+            500.0,
+            t.text,
+        )));
     }
     col()
         .key("models")
@@ -961,34 +839,13 @@ fn model_table(s: &State, t: Theme) -> El {
                         .key("models-title-row")
                         .gap(9.0)
                         .center_y()
-                        .child(label(
-                            "models-title",
-                            "Model breakdown",
-                            14.0,
-                            600.0,
-                            t.text,
-                        ))
+                        .child(label("models-title", "Models", 14.0, 600.0, t.text))
                         .child(
-                            label(
-                                "models-count",
-                                rows.len().to_string(),
-                                10.0,
-                                500.0,
-                                t.accent,
-                            )
-                            .px(7.0)
-                            .py(3.0)
-                            .radius(5.0)
-                            .fill(t.wash),
+                            Badge::new(rows.len().to_string())
+                                .build(t.kit)
+                                .key("models-count"),
                         ),
-                )
-                .child(label(
-                    "models-sort",
-                    "Highest cost first",
-                    10.0,
-                    400.0,
-                    t.faint,
-                )),
+                ),
         )
         .child(
             col()
@@ -1013,70 +870,20 @@ fn model_table(s: &State, t: Theme) -> El {
                 )
                 .child(list),
         )
-        .child(label(
-            "pricing-note",
-            "Estimated API pricing · includes cached tokens · stored locally",
-            10.0,
-            400.0,
-            t.faint,
-        ))
 }
 
 fn period_controls(s: &State, t: Theme) -> El {
-    let mut options = row()
-        .key("period-options")
-        .gap(4.0)
-        .padding(3.0)
-        .radius(8.0)
-        .fill(t.sidebar);
-    for (days, title) in [
-        (0, "All time"),
-        (7, "7 days"),
-        (30, "30 days"),
-        (90, "90 days"),
-    ] {
-        options = options.child(
-            el().key(format!("period-{days}"))
-                .role("button")
-                .px(12.0)
-                .py(6.0)
-                .radius(6.0)
-                .fill(if s.range_days == days {
-                    t.wash
-                } else {
-                    Color::TRANSPARENT
-                })
-                .hover(t.panel)
-                .on_press(move |s: &mut State| {
-                    s.range_days = days;
-                    s.apply_period();
-                })
-                .child(label(
-                    &format!("period-label-{days}"),
-                    title,
-                    11.0,
-                    500.0,
-                    if s.range_days == days {
-                        t.accent
-                    } else {
-                        t.muted
-                    },
-                )),
-        );
-    }
-    row()
-        .key("period")
-        .w_full()
-        .center_y()
-        .justify_between()
-        .child(label(
-            "period-caption",
-            "USAGE & SPEND",
-            10.0,
-            600.0,
-            t.faint,
-        ))
-        .child(options)
+    let selected = [0, 7, 30, 90].iter().position(|days| *days == s.range_days);
+    row().key("period").w_full().justify_end().child(
+        SegmentedControl::new(&["All time", "7 days", "30 days", "90 days"], selected)
+            .fit()
+            .on_pick(|s: &mut State, index, _| {
+                s.range_days = [0, 7, 30, 90][index];
+                s.apply_period();
+            })
+            .build(t.kit)
+            .key("period-options"),
+    )
 }
 fn daily_chart(s: &State, t: Theme) -> El {
     let days = if s.range_days == 0 { 30 } else { s.range_days };
@@ -1107,6 +914,7 @@ fn daily_chart(s: &State, t: Theme) -> El {
         bars = bars.child(
             col()
                 .key(format!("day-{i}"))
+                .help(format!("{} · {}", dates[i], money(*cost)))
                 .grow(1.0)
                 .min_w(0.0)
                 .h_full()
@@ -1126,6 +934,7 @@ fn daily_chart(s: &State, t: Theme) -> El {
     }
     col()
         .key("daily-chart")
+        .help("UTC · cost grouped by session start date. Undated sessions appear in All time only. All time chart shows the last 30 days.")
         .w_full()
         .gap(12.0)
         .child(
@@ -1164,13 +973,6 @@ fn daily_chart(s: &State, t: Theme) -> El {
                     t.faint,
                 )),
         )
-        .child(label(
-            "daily-method",
-            "UTC · cost grouped by session start date · undated sessions included in All time only",
-            10.0,
-            400.0,
-            t.faint,
-        ))
 }
 fn token_totals(s: &State, t: Theme) -> El {
     let st = selected_stats(s);

@@ -1,4 +1,4 @@
 [
-  {"t": 0.1, "type": "tap", "key": "period-7"},
-  {"t": 0.3, "type": "tap", "key": "source-claude"}
+  {"t": 0.1, "type": "tap", "key": "period-options/segment1"},
+  {"t": 0.3, "type": "tap", "key": "source-list/scroll/group0/item1"}
 ]
