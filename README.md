@@ -83,9 +83,15 @@ Re-run `bun run install-bin` after editing `usage_tracker.py` or `pricing.json`.
 
 `native/` is a native Rust UI built with the
 [Rune](https://github.com/anomalyco/rune) graphics library (`dev` rev
-`e12e3e4`), styled with Rune's design system: unbranded core tokens +
-the OpenCode theme (`rune-theme-opencode`, Inter + IBM Plex Mono, light/dark)
-as the reference theme — same look on every platform, not native macOS chrome.
+`e12e3e4`), using the OpenCode theme's neutral surfaces, blue accent,
+Inter typography, and light/dark appearances. The dashboard includes a source
+sidebar, date filters, daily cost bars, token totals, source cost shares, and
+an uncapped, scrollable model breakdown. Refreshes scan in the background.
+
+Date filters use UTC session start dates for OpenCode, Codex, Claude Code,
+and Gemini. Undated sessions remain in All time; daily costs are attributed
+to the session's start date rather than individual message times. The All time
+chart shows the latest 30 days. API costs are estimates, not subscription bills.
 
 The app embeds `usage_tracker.py` + `pricing.json` at compile time and shells
 to `python3` at runtime (same as the TUI), so macOS needs `brew install python`.
@@ -98,7 +104,7 @@ cargo run            # run windowed (needs display + GPU)
 ```
 
 Keys: `g` toggle global/dir scope · `r` refresh · `t` theme (Auto/Light/Dark).
-Buttons for the same actions are in the header.
+Scope and refresh controls are in the header; appearance is in the sidebar.
 
 GitHub Actions (`.github/workflows/native-mac.yml`) builds on every push to
 `main`/`master` touching `native/**`:

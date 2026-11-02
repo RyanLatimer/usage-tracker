@@ -1,17 +1,9 @@
-//! agent-usage native UI built with Rune + OpenCode theme.
-//!
-//! Design: Rune ships no brand — core is unbranded tokens, and the OpenCode
-//! theme (`rune-theme-opencode`, generated from `@opencode/ui`) is the first
-//! theme and reference example. This app uses exactly that: `kit(dark)` for
-//! colours/type/radius/motion, Inter + IBM Plex Mono fonts, same look on
-//! every platform (PLAN.md §7).
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
-use rune::{AppSpec, Cx, El, col, el, row, text};
-use rune_kit::{Badge, Button, Kit};
+use rune::{col, el, row, text, AppSpec, Cx, El};
+use rune::{Color, ScrollSpec, TextStyle};
 
 // ---------------------------------------------------------------- data
 
@@ -33,8 +25,6 @@ struct Stats {
     #[serde(default)]
     cache_write_tokens: u64,
     #[serde(default)]
-    reasoning_tokens: u64,
-    #[serde(default)]
     cost_usd: f64,
     #[serde(default)]
     unpriced: bool,
@@ -43,11 +33,7 @@ struct Stats {
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 struct Harness {
     #[serde(default)]
-    store: String,
-    #[serde(default)]
     found: bool,
-    #[serde(default)]
-    note: String,
     #[serde(default)]
     sessions: u64,
     #[serde(default)]
@@ -68,7 +54,10 @@ struct Harness {
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 struct Report {
-    scope: Option<String>,
+    #[serde(default)]
+    daily: HashMap<String, std::collections::BTreeMap<String, HashMap<String, Stats>>>,
+    #[serde(default)]
+    chart_dates: Vec<String>,
     #[serde(default)]
     harnesses: HashMap<String, Harness>,
     #[serde(default)]
@@ -100,7 +89,7 @@ fn dirs_home() -> PathBuf {
 }
 
 fn cache_hash() -> u64 {
-    use std::hash::{Hash, Hasher as _};
+    use std::hash::Hash;
     let mut h = std::collections::hash_map::DefaultHasher::new();
     SCRIPT.hash(&mut h);
     PRICING.hash(&mut h);
@@ -109,10 +98,7 @@ fn cache_hash() -> u64 {
 
 fn load_report(global: bool) -> Result<Report, String> {
     let script = cache_script();
-    let mut args = vec![
-        script.to_string_lossy().to_string(),
-        "--json".to_string(),
-    ];
+    let mut args = vec![script.to_string_lossy().to_string(), "--json".to_string()];
     if global {
         args.push("--global".to_string());
     } else {
@@ -139,6 +125,34 @@ fn load_report(global: bool) -> Result<Report, String> {
     serde_json::from_slice(&out.stdout).map_err(|e| format!("bad JSON: {e}"))
 }
 
+impl Stats {
+    fn add(&mut self, s: &Self) {
+        self.sessions += s.sessions;
+        self.messages += s.messages;
+        self.input_tokens += s.input_tokens;
+        self.output_tokens += s.output_tokens;
+        self.cache_read_tokens += s.cache_read_tokens;
+        self.cache_write_tokens += s.cache_write_tokens;
+        self.cost_usd += s.cost_usd;
+        self.unpriced |= s.unpriced;
+    }
+}
+fn poll(s: &mut State, _: f64, _: &mut rune::Tx) -> bool {
+    let result = s.pending.as_ref().and_then(|rx| rx.try_recv().ok());
+    if let Some(result) = result {
+        s.pending = None;
+        match result {
+            Ok(report) => {
+                s.all_report = report;
+                s.apply_period();
+                s.error = None;
+            }
+            Err(e) => s.error = Some(e),
+        }
+        return true;
+    }
+    false
+}
 // ---------------------------------------------------------------- state
 
 struct State {
@@ -147,31 +161,85 @@ struct State {
     selected: String,
     report: Report,
     error: Option<String>,
+    all_report: Report,
+    range_days: usize,
+    pending: Option<std::sync::mpsc::Receiver<Result<Report, String>>>,
+    waker: Option<rune::Waker>,
 }
 
 impl State {
     fn init() -> Self {
         let global_scope = true;
-        let (report, error) = match load_report(global_scope) {
-            Ok(r) => (r, None),
-            Err(e) => (Report::default(), Some(e)),
+        let (report, error) = if rune::is_headless() {
+            match load_report(global_scope) {
+                Ok(r) => (r, None),
+                Err(e) => (Report::default(), Some(e)),
+            }
+        } else {
+            (Report::default(), None)
         };
         State {
             appearance: 0,
             global_scope,
-            selected: "*".to_string(),
+            selected: "*".into(),
+            all_report: report.clone(),
             report,
             error,
+            range_days: 0,
+            pending: None,
+            waker: None,
         }
     }
-
     fn reload(&mut self) {
-        match load_report(self.global_scope) {
-            Ok(r) => {
-                self.report = r;
-                self.error = None;
+        let global = self.global_scope;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.pending = Some(rx);
+        let wake = self.waker.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(load_report(global));
+            if let Some(wake) = wake {
+                wake();
             }
-            Err(e) => self.error = Some(e),
+        });
+    }
+    fn apply_period(&mut self) {
+        self.report = self.all_report.clone();
+        if self.range_days == 0 {
+            return;
+        }
+        self.report.models.clear();
+        self.report.total = Stats::default();
+        let dates: Vec<_> = self
+            .all_report
+            .chart_dates
+            .iter()
+            .rev()
+            .take(self.range_days)
+            .collect();
+        for (name, h) in &mut self.report.harnesses {
+            h.by_model.clear();
+            if let Some(days) = self.all_report.daily.get(name) {
+                for date in &dates {
+                    if let Some(bucket) = days.get(*date) {
+                        for (model, st) in bucket {
+                            h.by_model.entry(model.clone()).or_default().add(st);
+                        }
+                    }
+                }
+            }
+            let mut total = Stats::default();
+            for (model, st) in &h.by_model {
+                total.add(st);
+                self.report.models.entry(model.clone()).or_default().add(st);
+            }
+            h.sessions = total.sessions;
+            h.messages = total.messages;
+            h.input_tokens = total.input_tokens;
+            h.output_tokens = total.output_tokens;
+            h.cache_read_tokens = total.cache_read_tokens;
+            h.cache_write_tokens = total.cache_write_tokens;
+            h.cost_usd = total.cost_usd;
+            self.report.total.add(&total);
         }
     }
 
@@ -203,183 +271,95 @@ fn money(n: f64) -> String {
     format!("${:.2}", n)
 }
 
-// ---------------------------------------------------------------- view
+// ---------------------------------------------------------------- design
 
-fn view(s: &State, cx: &mut Cx<State>) -> El {
-    let dark = s.dark(cx.system_dark());
-    let k = rune_theme_opencode::kit(dark);
-    let mut overlays = Vec::new();
-    let body = col()
-        .key("window")
-        .w_full()
-        .h_full()
-        .fill(k.c.page)
-        .child(header(s, k))
-        .child(tiles(s, k))
-        .child(main_body(s, k))
-        .child(footer(s, k));
-    rune_kit::root(body, overlays.drain(..))
+fn ink(hex: &str) -> Color {
+    rune::color::hex(hex).expect("design color")
 }
 
-fn header(s: &State, k: &'static Kit) -> El {
-    let scope_label = if s.global_scope {
-        "all directories".to_string()
-    } else {
-        "this directory + subdirs".to_string()
-    };
-    let appearance_label = match s.appearance {
-        1 => "Light",
-        2 => "Dark",
-        _ => "Auto",
-    };
-    row()
-        .key("header")
-        .w_full()
-        .h(52.0)
-        .px(16.0)
-        .center_y()
-        .justify_between()
-        .fill(k.c.bg_base)
-        .child(
-            col().key("title-col").gap(2.0).child(
-                text("agent-usage")
-                    .key("title")
-                    .font(k.ty.ui_medium)
-                    .color(k.c.text_base),
-            ).child(
-                text(scope_label)
-                    .key("scope")
-                    .font(k.ty.small)
-                    .color(k.c.text_muted),
-            ),
-        )
-        .child(
-            row().key("actions").gap(8.0).center_y()
-                .child(
-                    Button::new(if s.global_scope { "Global" } else { "Dir" })
-                        .on_press(|s: &mut State| {
-                            s.global_scope = !s.global_scope;
-                            s.reload();
-                        })
-                        .build(k)
-                        .key("scope-btn"),
-                )
-                .child(
-                    Button::new(appearance_label)
-                        .on_press(|s: &mut State| {
-                            s.appearance = (s.appearance + 1) % 3;
-                        })
-                        .build(k)
-                        .key("theme-btn"),
-                )
-                .child(
-                    Button::new("Refresh")
-                        .on_press(|s: &mut State| s.reload())
-                        .build(k)
-                        .key("refresh-btn"),
-                ),
-        )
+#[derive(Clone, Copy)]
+struct Theme {
+    page: Color,
+    sidebar: Color,
+    panel: Color,
+    line: Color,
+    text: Color,
+    muted: Color,
+    faint: Color,
+    accent: Color,
+    wash: Color,
 }
-
-fn tile(k: &'static Kit, key: &str, title: &str, value: String, sub: String) -> El {
-    col()
-        .key(key)
-        .grow(1.0)
-        .gap(2.0)
-        .padding(12.0)
-        .radius(k.radius.lg)
-        .fill(k.c.layer_01)
-        .border(1.0, k.c.border_muted)
-        .child(text(title).key(format!("{key}-t")).font(k.ty.small).color(k.c.text_muted))
-        .child(text(value).key(format!("{key}-v")).font(k.ty.body_medium).color(k.c.text_base))
-        .child(text(sub).key(format!("{key}-s")).font(k.ty.small).color(k.c.text_faint))
-}
-
-fn tiles(s: &State, k: &'static Kit) -> El {
-    let t = &s.report.total;
-    let tokens = t.input_tokens + t.output_tokens + t.cache_read_tokens + t.cache_write_tokens;
-    row()
-        .key("tiles")
-        .w_full()
-        .px(16.0)
-        .py(12.0)
-        .gap(12.0)
-        .child(tile(k, "cost", "API cost", money(t.cost_usd), format!("{} models", s.report.models.len())))
-        .child(tile(k, "sess", "Sessions", format!("{}", t.sessions), format!("{} msgs", t.messages)))
-        .child(tile(k, "msgs", "Messages", format!("{}", t.messages), format!("{} sess", t.sessions)))
-        .child(tile(
-            k,
-            "toks",
-            "Tokens",
-            compact(tokens),
-            format!("in {} · out {}", compact(t.input_tokens), compact(t.output_tokens)),
-        ))
-}
-
-fn main_body(s: &State, k: &'static Kit) -> El {
-    row()
-        .key("body")
-        .w_full()
-        .grow(1.0)
-        .px(16.0)
-        .pb(12.0)
-        .gap(12.0)
-        .child(harness_list(s, k))
-        .child(model_table(s, k))
-}
-
-fn harness_list(s: &State, k: &'static Kit) -> El {
-    let mut names: Vec<(&String, &Harness)> = s.report.harnesses.iter().collect();
-    names.sort_by(|a, b| b.1.cost_usd.partial_cmp(&a.1.cost_usd).unwrap());
-    let mut list = col().key("harness-items").gap(4.0);
-    let all_sel = s.selected == "*";
-    list = list.child(harness_row(
-        k,
-        "all",
-        "All harnesses",
-        &format!("{} · {} sess", money(s.report.total.cost_usd), s.report.total.sessions),
-        all_sel,
-        "*".to_string(),
-    ));
-    for (name, h) in names {
-        if h.sessions == 0 && !h.found {
-            continue;
+impl Theme {
+    fn new(dark: bool) -> Self {
+        let k = rune_theme_opencode::kit(dark);
+        Self {
+            page: k.c.page,
+            sidebar: k.c.bg_base,
+            panel: k.c.layer_01,
+            line: k.c.border_muted,
+            text: k.c.text_base,
+            muted: k.c.text_muted,
+            faint: k.c.text_faint,
+            accent: k.c.text_accent,
+            wash: k.c.layer_01.mix(k.c.text_accent, 0.07),
         }
-        let sub = format!("{} · {} sess", money(h.cost_usd), h.sessions);
-        list = list.child(harness_row(k, name, name, &sub, s.selected == *name, name.clone()));
     }
-    col()
-        .key("harnesses")
-        .w(248.0)
-        .h_full()
-        .gap(8.0)
-        .padding(12.0)
-        .radius(k.radius.lg)
-        .fill(k.c.layer_01)
-        .border(1.0, k.c.border_muted)
-        .child(text("Harness").key("h-title").font(k.ty.small_medium).color(k.c.text_muted))
-        .child(list)
 }
-
-fn harness_row(k: &'static Kit, key: &str, name: &str, sub: &str, selected: bool, value: String) -> El {
-    el()
-        .key(format!("h-{key}"))
-        .role("button")
-        .w_full()
-        .padding(8.0)
-        .radius(k.radius.md)
-        .fill(if selected { k.c.hover } else { rune::Color::TRANSPARENT })
-        .hover(k.c.hover)
-        .on_press(move |s: &mut State| s.selected = value.clone())
-        .child(
-            col().key(format!("h-{key}-c")).gap(2.0)
-                .child(text(name.to_string()).key(format!("h-{key}-n")).font(k.ty.ui_medium).color(k.c.text_base))
-                .child(text(sub.to_string()).key(format!("h-{key}-s")).font(k.ty.small).color(k.c.text_muted)),
-        )
+fn label(key: &str, value: impl Into<String>, size: f32, weight: f32, color: Color) -> El {
+    text(value.into())
+        .key(key)
+        .font(TextStyle::new(size, weight).features("'tnum' 1"))
+        .color(color)
 }
-
-fn model_table(s: &State, k: &'static Kit) -> El {
-    let models: Vec<(&String, &Stats)> = if s.selected == "*" {
+fn rule(key: &str, t: Theme) -> El {
+    el().key(key).w_full().h(1.0).fill(t.line)
+}
+fn dot(key: &str, color: Color) -> El {
+    el().key(key).size(7.0, 7.0).radius(4.0).fill(color)
+}
+fn source_color(name: &str) -> Color {
+    ink(match name {
+        "opencode" => "#A8E6BE",
+        "claude" => "#E6B294",
+        "codex" => "#9CBFEB",
+        "cursor" => "#C6B2EB",
+        "copilot" => "#E2CB87",
+        _ => "#8CBDB4",
+    })
+}
+fn source_name(name: &str) -> String {
+    match name {
+        "opencode" => "OpenCode",
+        "claude" => "Claude Code",
+        "codex" => "Codex",
+        "cursor" => "Cursor",
+        "copilot" => "GitHub Copilot",
+        "grok" => "Grok",
+        _ => name,
+    }
+    .to_string()
+}
+fn selected_stats(s: &State) -> Stats {
+    if s.selected == "*" {
+        return s.report.total.clone();
+    }
+    s.report
+        .harnesses
+        .get(&s.selected)
+        .map(|h| Stats {
+            sessions: h.sessions,
+            messages: h.messages,
+            input_tokens: h.input_tokens,
+            output_tokens: h.output_tokens,
+            cache_read_tokens: h.cache_read_tokens,
+            cache_write_tokens: h.cache_write_tokens,
+            cost_usd: h.cost_usd,
+            ..Stats::default()
+        })
+        .unwrap_or_default()
+}
+fn models(s: &State) -> Vec<(&String, &Stats)> {
+    let mut rows: Vec<_> = if s.selected == "*" {
         s.report.models.iter().collect()
     } else {
         s.report
@@ -388,99 +368,841 @@ fn model_table(s: &State, k: &'static Kit) -> El {
             .map(|h| h.by_model.iter().collect())
             .unwrap_or_default()
     };
-    let mut rows: Vec<(&String, &Stats)> = models;
-    rows.sort_by(|a, b| b.1.cost_usd.partial_cmp(&a.1.cost_usd).unwrap());
-    rows.truncate(14);
-
-    let mut list = col().key("model-rows").gap(2.0);
-    if rows.is_empty() {
-        let msg = s.error.clone().unwrap_or_else(|| "No sessions in scope.".to_string());
-        list = list.child(
-            text(msg).key("empty").font(k.ty.ui).color(k.c.text_muted),
-        );
-    }
-    for (name, st) in rows {
-        let unpriced = st.unpriced && st.cost_usd == 0.0;
-        list = list.child(
+    rows.sort_by(|a, b| b.1.cost_usd.total_cmp(&a.1.cost_usd).then(a.0.cmp(b.0)));
+    rows
+}
+fn view(s: &State, cx: &mut Cx<State>) -> El {
+    let t = Theme::new(s.dark(cx.system_dark()));
+    let chrome = row()
+        .key("chrome")
+        .w_full()
+        .h(38.0)
+        .px(18.0)
+        .center_y()
+        .window_drag()
+        .child(el().key("traffic-space").w(cx.titlebar_inset().max(78.0)))
+        .child(label("window-title", "AGENT USAGE", 10.0, 600.0, t.faint));
+    let content = col()
+        .key("content")
+        .grow(1.0)
+        .min_w(0.0)
+        .min_h(0.0)
+        .padding(28.0)
+        .gap(24.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(header(s, t))
+        .child(period_controls(s, t))
+        .child(summary(s, t))
+        .child(daily_chart(s, t))
+        .child(token_totals(s, t))
+        .child(allocation(s, t))
+        .child(model_table(s, t));
+    col()
+        .key("window")
+        .w_full()
+        .h_full()
+        .fill(t.page)
+        .child(chrome)
+        .child(
             row()
-                .key(format!("m-{name}"))
+                .key("workspace")
                 .w_full()
-                .px(8.0)
-                .py(6.0)
+                .grow(1.0)
+                .min_h(0.0)
+                .child(sidebar(s, t))
+                .child(content),
+        )
+}
+fn action(key: &str, title: &str, t: Theme, f: impl Fn(&mut State) + 'static) -> El {
+    el().key(key)
+        .role("button")
+        .h(30.0)
+        .px(11.0)
+        .center()
+        .radius(7.0)
+        .border(1.0, t.line)
+        .fill(t.panel)
+        .hover(t.wash)
+        .on_press(f)
+        .child(label(&format!("{key}-label"), title, 11.0, 500.0, t.muted))
+}
+fn header(s: &State, t: Theme) -> El {
+    let title = if s.selected == "*" {
+        "Overview".into()
+    } else {
+        source_name(&s.selected)
+    };
+    row()
+        .key("header")
+        .w_full()
+        .center_y()
+        .justify_between()
+        .gap(12.0)
+        .child(
+            col()
+                .key("heading")
+                .gap(6.0)
+                .grow(1.0)
+                .min_w(0.0)
+                .child(label("title", title, 27.0, 600.0, t.text))
+                .child(label(
+                    "subtitle",
+                    "A little clarity on your AI spend.",
+                    12.0,
+                    400.0,
+                    t.muted,
+                )),
+        )
+        .child(
+            row()
+                .key("actions")
+                .gap(8.0)
+                .child(action(
+                    "scope-btn",
+                    if s.global_scope {
+                        "All directories"
+                    } else {
+                        "Current directory"
+                    },
+                    t,
+                    |s| {
+                        s.global_scope = !s.global_scope;
+                        s.reload();
+                    },
+                ))
+                .child(action(
+                    "refresh-btn",
+                    if s.pending.is_some() {
+                        "Refreshing…"
+                    } else {
+                        "Refresh"
+                    },
+                    t,
+                    |s| s.reload(),
+                )),
+        )
+}
+fn sidebar(s: &State, t: Theme) -> El {
+    let mut nav = col().key("source-list").gap(5.0).child(nav_item(
+        "*",
+        "All sources",
+        s.report.total.sessions,
+        s.selected == "*",
+        t,
+    ));
+    let mut names: Vec<_> = s.report.harnesses.iter().collect();
+    names.sort_by(|a, b| b.1.cost_usd.total_cmp(&a.1.cost_usd).then(a.0.cmp(b.0)));
+    for (name, h) in &names {
+        if h.found || h.sessions > 0 {
+            nav = nav.child(nav_item(
+                name,
+                &source_name(name),
+                h.sessions,
+                s.selected == **name,
+                t,
+            ));
+        }
+    }
+    let theme = match s.appearance {
+        1 => "Appearance: Light",
+        2 => "Appearance: Dark",
+        _ => "Appearance: System",
+    };
+    let status = if s.error.is_some() {
+        "Could not refresh"
+    } else {
+        if s.pending.is_some() {
+            "Scanning local data…"
+        } else {
+            "Local data · on device"
+        }
+    };
+    col()
+        .key("sidebar")
+        .w(198.0)
+        .h_full()
+        .fill(t.sidebar)
+        .padding(16.0)
+        .gap(20.0)
+        .child(
+            row()
+                .key("brand")
                 .center_y()
-                .justify_between()
-                .radius(k.radius.sm)
-                .hover(k.c.hover)
+                .gap(10.0)
+                .py(10.0)
                 .child(
-                    col().key(format!("m-{name}-l")).gap(1.0).grow(1.0)
-                        .child(text(name.to_string()).key(format!("m-{name}-n")).font(k.ty.ui).color(k.c.text_base))
+                    el().key("brand-icon")
+                        .size(28.0, 28.0)
+                        .radius(8.0)
+                        .fill(t.accent)
+                        .center()
+                        .child(label("brand-glyph", "a", 22.0, 600.0, t.page)),
+                )
+                .child(label("brand-name", "Agent Usage", 14.0, 600.0, t.text)),
+        )
+        .child(label("nav-caption", "WORKSPACE", 9.0, 600.0, t.faint))
+        .child(
+            col()
+                .key("nav-scroll")
+                .grow(1.0)
+                .min_h(0.0)
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
+                .child(nav),
+        )
+        .child(
+            col()
+                .key("sidebar-bottom")
+                .gap(12.0)
+                .child(rule("sidebar-rule", t))
+                .child(action("theme-btn", theme, t, |s| {
+                    s.appearance = (s.appearance + 1) % 3
+                }))
+                .child(
+                    row()
+                        .key("local-status")
+                        .gap(7.0)
+                        .center_y()
+                        .child(dot(
+                            "status-dot",
+                            if s.error.is_some() {
+                                ink("#E6B294")
+                            } else {
+                                t.accent
+                            },
+                        ))
+                        .child(label("local-label", status, 10.0, 400.0, t.muted)),
+                ),
+        )
+}
+fn nav_item(value: &str, title: &str, count: u64, selected: bool, t: Theme) -> El {
+    let id = format!("source-{value}");
+    let choice = value.to_string();
+    row()
+        .key(&id)
+        .w_full()
+        .h(38.0)
+        .px(10.0)
+        .gap(9.0)
+        .center_y()
+        .radius(7.0)
+        .role("button")
+        .fill(if selected { t.wash } else { Color::TRANSPARENT })
+        .hover(t.wash)
+        .on_press(move |s: &mut State| s.selected = choice.clone())
+        .child(dot(
+            &format!("{id}-dot"),
+            if value == "*" {
+                t.accent
+            } else {
+                source_color(value)
+            },
+        ))
+        .child(
+            label(
+                &format!("{id}-name"),
+                title,
+                11.0,
+                if selected { 600.0 } else { 400.0 },
+                if selected { t.accent } else { t.muted },
+            )
+            .grow(1.0),
+        )
+        .child(label(
+            &format!("{id}-count"),
+            count.to_string(),
+            10.0,
+            400.0,
+            t.faint,
+        ))
+}
+fn summary(s: &State, t: Theme) -> El {
+    let st = selected_stats(s);
+    let tokens = st.input_tokens + st.output_tokens + st.cache_read_tokens + st.cache_write_tokens;
+    let mut hero = col()
+        .key("spend")
+        .grow(1.15)
+        .min_w(0.0)
+        .padding(22.0)
+        .gap(12.0)
+        .radius(12.0)
+        .fill(t.wash)
+        .child(label(
+            "spend-label",
+            "TOTAL API COST",
+            10.0,
+            600.0,
+            t.accent,
+        ))
+        .child(label(
+            "spend-value",
+            money(st.cost_usd),
+            42.0,
+            500.0,
+            t.text,
+        ))
+        .child(label(
+            "spend-note",
+            format!(
+                "Across {} models · {}",
+                models(s).len(),
+                if s.range_days == 0 {
+                    "all time".to_string()
+                } else {
+                    format!("{} days", s.range_days)
+                }
+            ),
+            11.0,
+            400.0,
+            t.muted,
+        ));
+    if let Some(e) = &s.error {
+        hero = hero.child(label("error", e, 11.0, 400.0, ink("#D59A7A")).max_lines(3));
+    }
+    let avg = if st.sessions > 0 {
+        st.cost_usd / st.sessions as f64
+    } else {
+        0.0
+    };
+    row().key("summary").w_full().gap(14.0).child(hero).child(
+        col()
+            .key("metrics")
+            .grow(1.0)
+            .min_w(0.0)
+            .padding(22.0)
+            .gap(16.0)
+            .radius(12.0)
+            .fill(t.panel)
+            .border(1.0, t.line)
+            .child(
+                row()
+                    .key("metric-top")
+                    .gap(20.0)
+                    .child(metric("sessions", "Sessions", compact(st.sessions), t))
+                    .child(metric("messages", "Messages", compact(st.messages), t)),
+            )
+            .child(rule("metric-rule", t))
+            .child(
+                row()
+                    .key("metric-bottom")
+                    .gap(20.0)
+                    .child(metric("tokens", "Total tokens", compact(tokens), t))
+                    .child(metric("average", "Cost / session", money(avg), t)),
+            ),
+    )
+}
+fn metric(key: &str, title: &str, value: String, t: Theme) -> El {
+    col()
+        .key(key)
+        .grow(1.0)
+        .min_w(0.0)
+        .gap(5.0)
+        .child(label(&format!("{key}-label"), title, 10.0, 400.0, t.muted))
+        .child(label(&format!("{key}-value"), value, 21.0, 500.0, t.text))
+}
+fn allocation(s: &State, t: Theme) -> El {
+    let mut entries: Vec<(String, f64, Color)> = if s.selected == "*" {
+        s.report
+            .harnesses
+            .iter()
+            .filter(|(_, h)| h.cost_usd > 0.0)
+            .map(|(n, h)| (source_name(n), h.cost_usd, source_color(n)))
+            .collect()
+    } else {
+        models(s)
+            .iter()
+            .filter(|(_, st)| st.cost_usd > 0.0)
+            .enumerate()
+            .map(|(i, (n, st))| {
+                (
+                    n.rsplit('/').next().unwrap_or(n).to_string(),
+                    st.cost_usd,
+                    chart_color(i),
+                )
+            })
+            .collect()
+    };
+    entries.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let total = entries.iter().map(|e| e.1).sum::<f64>();
+    let mut bar = row()
+        .key("allocation-bar")
+        .w_full()
+        .h(10.0)
+        .gap(3.0)
+        .clip_rounded(5.0);
+    let mut legend = row().key("allocation-legend").gap(22.0).w_full();
+    for (i, (name, cost, color)) in entries.iter().enumerate() {
+        bar = bar.child(
+            el().key(format!("segment-{i}"))
+                .h_full()
+                .grow((*cost / total) as f32)
+                .fill(*color),
+        );
+        if i < 3 {
+            legend = legend.child(
+                row()
+                    .key(format!("legend-{i}"))
+                    .center_y()
+                    .gap(7.0)
+                    .child(dot(&format!("legend-dot-{i}"), *color))
+                    .child(label(
+                        &format!("legend-name-{i}"),
+                        format!("{}  {:.0}%", name, 100.0 * cost / total),
+                        10.0,
+                        400.0,
+                        t.muted,
+                    )),
+            );
+        }
+    }
+    if entries.is_empty() {
+        bar = bar.child(el().key("allocation-empty").w_full().h_full().fill(t.line));
+        legend = legend.child(label(
+            "no-spend",
+            "No recorded cost in this scope",
+            11.0,
+            400.0,
+            t.muted,
+        ));
+    } else if entries.len() > 3 {
+        legend = legend.child(label(
+            "allocation-others",
+            format!("+ {} more", entries.len() - 3),
+            10.0,
+            400.0,
+            t.faint,
+        ));
+    }
+    col()
+        .key("allocation")
+        .gap(13.0)
+        .child(
+            row()
+                .key("allocation-heading")
+                .w_full()
+                .justify_between()
+                .child(label(
+                    "allocation-title",
+                    if s.selected == "*" {
+                        "Spend by source"
+                    } else {
+                        "Spend by model"
+                    },
+                    12.0,
+                    500.0,
+                    t.text,
+                ))
+                .child(label(
+                    "allocation-unit",
+                    "SHARE OF TOTAL COST",
+                    9.0,
+                    500.0,
+                    t.faint,
+                )),
+        )
+        .child(bar)
+        .child(legend)
+}
+fn chart_color(i: usize) -> Color {
+    ink(["#A8E6BE", "#9CBFEB", "#E6B294", "#C6B2EB", "#E2CB87"][i % 5])
+}
+fn model_table(s: &State, t: Theme) -> El {
+    let rows = models(s);
+    let total = selected_stats(s).cost_usd;
+    let mut list = col().key("model-rows").w_full();
+    for (i, (name, st)) in rows.iter().enumerate() {
+        let id = format!("model-{name}");
+        let (provider, model) = name.rsplit_once('/').unwrap_or(("", name.as_str()));
+        let share = if total > 0.0 {
+            (st.cost_usd / total).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let mut bar = row()
+            .key(format!("{id}-bar"))
+            .w(56.0)
+            .h(4.0)
+            .radius(2.0)
+            .fill(t.line);
+        if share > 0.0 {
+            bar = bar.child(
+                el().key(format!("{id}-bar-fill"))
+                    .w((56.0 * share) as f32)
+                    .h(4.0)
+                    .radius(2.0)
+                    .fill(t.accent),
+            );
+        }
+        list = list.child(rule(&format!("{id}-rule"), t)).child(
+            row()
+                .key(&id)
+                .w_full()
+                .h(58.0)
+                .px(16.0)
+                .gap(12.0)
+                .center_y()
+                .hover(t.sidebar)
+                .child(
+                    label(
+                        &format!("{id}-rank"),
+                        format!("{:02}", i + 1),
+                        10.0,
+                        400.0,
+                        t.faint,
+                    )
+                    .w(22.0),
+                )
+                .child(
+                    col()
+                        .key(format!("{id}-identity"))
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .gap(3.0)
                         .child(
-                            text(format!(
-                                "{} sess · {} in · {} out",
-                                st.sessions,
-                                compact(st.input_tokens),
-                                compact(st.output_tokens)
-                            ))
-                            .key(format!("m-{name}-s"))
-                            .font(k.ty.small)
-                            .color(k.c.text_faint),
+                            label(&format!("{id}-name"), model, 12.0, 500.0, t.text).max_lines(1),
+                        )
+                        .child(
+                            label(
+                                &format!("{id}-provider"),
+                                if provider.is_empty() {
+                                    "Direct"
+                                } else {
+                                    provider
+                                },
+                                10.0,
+                                400.0,
+                                t.faint,
+                            )
+                            .max_lines(1),
                         ),
                 )
                 .child(
-                    if unpriced {
-                        Badge::new("unpriced").build(k).key(format!("m-{name}-b"))
-                    } else {
-                        text(money(st.cost_usd))
-                            .key(format!("m-{name}-c"))
-                            .font(k.ty.ui_medium)
-                            .color(k.c.text_base)
-                    },
+                    label(
+                        &format!("{id}-sessions"),
+                        compact(st.sessions),
+                        11.0,
+                        400.0,
+                        t.muted,
+                    )
+                    .w(58.0),
+                )
+                .child(
+                    label(
+                        &format!("{id}-tokens"),
+                        compact(
+                            st.input_tokens
+                                + st.output_tokens
+                                + st.cache_read_tokens
+                                + st.cache_write_tokens,
+                        ),
+                        11.0,
+                        400.0,
+                        t.muted,
+                    )
+                    .w(65.0),
+                )
+                .child(
+                    col()
+                        .key(format!("{id}-cost-col"))
+                        .w(76.0)
+                        .gap(4.0)
+                        .child(label(
+                            &format!("{id}-cost"),
+                            if st.unpriced && st.cost_usd == 0.0 {
+                                "Unpriced".into()
+                            } else {
+                                money(st.cost_usd)
+                            },
+                            12.0,
+                            500.0,
+                            t.text,
+                        ))
+                        .child(bar),
                 ),
+        );
+    }
+    if rows.is_empty() {
+        list = list.child(
+            col()
+                .key("empty-state")
+                .padding(30.0)
+                .gap(8.0)
+                .child(label(
+                    "empty-title",
+                    "Nothing here yet",
+                    16.0,
+                    500.0,
+                    t.text,
+                ))
+                .child(label(
+                    "empty-description",
+                    "Your models will appear after a recorded session. Refresh to check again.",
+                    12.0,
+                    400.0,
+                    t.muted,
+                )),
         );
     }
     col()
         .key("models")
-        .grow(1.0)
-        .h_full()
-        .gap(8.0)
-        .padding(12.0)
-        .radius(k.radius.lg)
-        .fill(k.c.layer_01)
-        .border(1.0, k.c.border_muted)
-        .child(
-            row().key("m-head").w_full().justify_between().center_y()
-                .child(text(if s.selected == "*" { "Models".to_string() } else { s.selected.clone() }).key("m-title").font(k.ty.small_medium).color(k.c.text_muted))
-                .child(text(format!("{} shown", rows_len(s))).key("m-count").font(k.ty.small).color(k.c.text_faint)),
-        )
-        .child(list)
-}
-
-fn rows_len(s: &State) -> usize {
-    if s.selected == "*" {
-        s.report.models.len().min(14)
-    } else {
-        s.report
-            .harnesses
-            .get(&s.selected)
-            .map(|h| h.by_model.len().min(14))
-            .unwrap_or(0)
-    }
-}
-
-fn footer(s: &State, k: &'static Kit) -> El {
-    let msg = if let Some(e) = &s.error {
-        e.clone()
-    } else {
-        "g scope · r refresh · t theme — python3 required (brew install python)".to_string()
-    };
-    row()
-        .key("footer")
         .w_full()
-        .h(28.0)
-        .px(16.0)
+        .gap(14.0)
+        .child(
+            row()
+                .key("models-heading")
+                .w_full()
+                .justify_between()
+                .center_y()
+                .child(
+                    row()
+                        .key("models-title-row")
+                        .gap(9.0)
+                        .center_y()
+                        .child(label(
+                            "models-title",
+                            "Model breakdown",
+                            14.0,
+                            600.0,
+                            t.text,
+                        ))
+                        .child(
+                            label(
+                                "models-count",
+                                rows.len().to_string(),
+                                10.0,
+                                500.0,
+                                t.accent,
+                            )
+                            .px(7.0)
+                            .py(3.0)
+                            .radius(5.0)
+                            .fill(t.wash),
+                        ),
+                )
+                .child(label(
+                    "models-sort",
+                    "Highest cost first",
+                    10.0,
+                    400.0,
+                    t.faint,
+                )),
+        )
+        .child(
+            col()
+                .key("model-table")
+                .w_full()
+                .radius(10.0)
+                .clip_rounded(10.0)
+                .fill(t.panel)
+                .border(1.0, t.line)
+                .child(
+                    row()
+                        .key("column-headings")
+                        .w_full()
+                        .h(33.0)
+                        .px(16.0)
+                        .gap(12.0)
+                        .center_y()
+                        .child(label("column-model", "MODEL", 9.0, 500.0, t.faint).grow(1.0))
+                        .child(label("column-sessions", "SESSIONS", 9.0, 500.0, t.faint).w(58.0))
+                        .child(label("column-tokens", "TOKENS", 9.0, 500.0, t.faint).w(65.0))
+                        .child(label("column-cost", "COST", 9.0, 500.0, t.faint).w(76.0)),
+                )
+                .child(list),
+        )
+        .child(label(
+            "pricing-note",
+            "Estimated API pricing · includes cached tokens · stored locally",
+            10.0,
+            400.0,
+            t.faint,
+        ))
+}
+
+fn period_controls(s: &State, t: Theme) -> El {
+    let mut options = row()
+        .key("period-options")
+        .gap(4.0)
+        .padding(3.0)
+        .radius(8.0)
+        .fill(t.sidebar);
+    for (days, title) in [
+        (0, "All time"),
+        (7, "7 days"),
+        (30, "30 days"),
+        (90, "90 days"),
+    ] {
+        options = options.child(
+            el().key(format!("period-{days}"))
+                .role("button")
+                .px(12.0)
+                .py(6.0)
+                .radius(6.0)
+                .fill(if s.range_days == days {
+                    t.wash
+                } else {
+                    Color::TRANSPARENT
+                })
+                .hover(t.panel)
+                .on_press(move |s: &mut State| {
+                    s.range_days = days;
+                    s.apply_period();
+                })
+                .child(label(
+                    &format!("period-label-{days}"),
+                    title,
+                    11.0,
+                    500.0,
+                    if s.range_days == days {
+                        t.accent
+                    } else {
+                        t.muted
+                    },
+                )),
+        );
+    }
+    row()
+        .key("period")
+        .w_full()
         .center_y()
-        .fill(k.c.bg_base)
-        .child(text(msg).key("hint").font(k.ty.small).color(k.c.text_faint))
+        .justify_between()
+        .child(label(
+            "period-caption",
+            "USAGE & SPEND",
+            10.0,
+            600.0,
+            t.faint,
+        ))
+        .child(options)
+}
+fn daily_chart(s: &State, t: Theme) -> El {
+    let days = if s.range_days == 0 { 30 } else { s.range_days };
+    let dates: Vec<_> = s
+        .all_report
+        .chart_dates
+        .iter()
+        .rev()
+        .take(days)
+        .rev()
+        .collect();
+    let mut values = Vec::new();
+    for date in &dates {
+        let cost: f64 = s
+            .all_report
+            .daily
+            .iter()
+            .filter(|(source, _)| s.selected == "*" || s.selected == **source)
+            .filter_map(|(_, d)| d.get(*date))
+            .flat_map(|bucket| bucket.values())
+            .map(|st| st.cost_usd)
+            .sum();
+        values.push(cost);
+    }
+    let peak = values.iter().copied().fold(0.0_f64, f64::max);
+    let mut bars = row().key("daily-bars").w_full().h(104.0).gap(3.0);
+    for (i, cost) in values.iter().enumerate() {
+        bars = bars.child(
+            col()
+                .key(format!("day-{i}"))
+                .grow(1.0)
+                .min_w(0.0)
+                .h_full()
+                .justify_end()
+                .child(
+                    el().key(format!("day-bar-{i}"))
+                        .w_full()
+                        .h(if peak > 0.0 {
+                            (cost / peak * 100.0).max(2.0) as f32
+                        } else {
+                            2.0
+                        })
+                        .radius(2.0)
+                        .fill(if *cost > 0.0 { t.accent } else { t.line }),
+                ),
+        );
+    }
+    col()
+        .key("daily-chart")
+        .w_full()
+        .gap(12.0)
+        .child(
+            row()
+                .key("daily-header")
+                .w_full()
+                .justify_between()
+                .child(label("daily-title", "Daily cost", 13.0, 500.0, t.text))
+                .child(label(
+                    "daily-peak",
+                    format!("Peak {} / day", money(peak)),
+                    10.0,
+                    400.0,
+                    t.muted,
+                )),
+        )
+        .child(bars)
+        .child(rule("daily-baseline", t))
+        .child(
+            row()
+                .key("daily-axis")
+                .w_full()
+                .justify_between()
+                .child(label(
+                    "daily-start",
+                    dates.first().map(|d| d.as_str()).unwrap_or(""),
+                    10.0,
+                    400.0,
+                    t.faint,
+                ))
+                .child(label(
+                    "daily-end",
+                    dates.last().map(|d| d.as_str()).unwrap_or(""),
+                    10.0,
+                    400.0,
+                    t.faint,
+                )),
+        )
+        .child(label(
+            "daily-method",
+            "UTC · cost grouped by session start date · undated sessions included in All time only",
+            10.0,
+            400.0,
+            t.faint,
+        ))
+}
+fn token_totals(s: &State, t: Theme) -> El {
+    let st = selected_stats(s);
+    row()
+        .key("token-totals")
+        .w_full()
+        .py(16.0)
+        .gap(18.0)
+        .child(metric(
+            "fresh-tokens",
+            "Uncached input",
+            compact(st.input_tokens),
+            t,
+        ))
+        .child(metric(
+            "cache-read",
+            "Cache read",
+            compact(st.cache_read_tokens),
+            t,
+        ))
+        .child(metric(
+            "cache-write",
+            "Cache write",
+            compact(st.cache_write_tokens),
+            t,
+        ))
+        .child(metric(
+            "output-tokens",
+            "Output",
+            compact(st.output_tokens),
+            t,
+        ))
 }
 
 fn on_key(s: &mut State, ev: &rune::KeyEvent, _tx: &mut rune::Tx) -> bool {
@@ -510,14 +1232,79 @@ fn main() {
     rune::run(AppSpec {
         scenes: &[
             ("default", |_: &mut State| {}),
+            ("demo", |s: &mut State| {
+                s.all_report = serde_json::from_str(include_str!("../fixtures/usage.json"))
+                    .expect("demo fixture");
+                s.report = s.all_report.clone();
+                s.error = None;
+            }),
+            ("demo-light", |s: &mut State| {
+                s.all_report = serde_json::from_str(include_str!("../fixtures/usage.json"))
+                    .expect("demo fixture");
+                s.report = s.all_report.clone();
+                s.appearance = 1;
+                s.error = None;
+            }),
             ("empty", |s: &mut State| {
                 s.report = Report::default();
                 s.error = None;
             }),
         ],
+        setup: Some(|s, wake| {
+            s.waker = Some(wake);
+            if !rune::is_headless() {
+                s.reload();
+            }
+        }),
+        poll: Some(poll),
         fonts: rune_theme_opencode::FONTS,
         families: rune_theme_opencode::FAMILIES,
         on_key: Some(on_key),
-        ..AppSpec::new("Agent Usage", (980.0, 660.0), State::init, view)
+        min_size: Some((900.0, 620.0)),
+        ..AppSpec::new("Agent Usage", (1120.0, 780.0), State::init, view)
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn fixture() -> State {
+        let report: Report = serde_json::from_str(include_str!("../fixtures/usage.json")).unwrap();
+        State {
+            appearance: 2,
+            global_scope: true,
+            selected: "*".into(),
+            report: report.clone(),
+            all_report: report,
+            error: None,
+            range_days: 0,
+            pending: None,
+            waker: None,
+        }
+    }
+    #[test]
+    fn period_reconciles_models_sources_and_totals() {
+        let mut s = fixture();
+        s.range_days = 7;
+        s.apply_period();
+        let sources: f64 = s.report.harnesses.values().map(|h| h.cost_usd).sum();
+        let models: f64 = s.report.models.values().map(|m| m.cost_usd).sum();
+        assert!((sources - s.report.total.cost_usd).abs() < 1e-8);
+        assert!((models - sources).abs() < 1e-8);
+        assert!(sources > 0.0 && sources < s.all_report.total.cost_usd);
+        s.range_days = 0;
+        s.apply_period();
+        assert_eq!(s.report.total.sessions, 56);
+    }
+    #[test]
+    fn source_selection_filters_summary_and_model_table() {
+        let mut s = fixture();
+        s.selected = "claude".into();
+        assert_eq!(selected_stats(&s).sessions, 9);
+        assert_eq!(models(&s).len(), 1);
+        assert!(models(&s)[0].0.contains("claude"));
+        s.selected = "missing".into();
+        assert_eq!(selected_stats(&s).sessions, 0);
+        assert!(models(&s).is_empty());
+    }
 }

@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import argparse
 import collections
+import copy
+from datetime import datetime, timedelta, timezone
 import glob
 import json
 import os
@@ -202,12 +204,42 @@ class HarnessResult:
     sub_sessions: int = 0
     sub_messages: int = 0
 
+    daily: dict[str, dict[str, ModelStats]] = field(default_factory=dict)
+
     @property
     def total(self) -> ModelStats:
         t = ModelStats()
         for s in self.per_model.values():
             t.add(s)
         return t
+
+
+def session_day(value) -> str | None:
+    """UTC session start date. Never substitute file modification times."""
+    try:
+        if isinstance(value, (int, float)):
+            if value > 1e11:
+                value /= 1000
+            return datetime.fromtimestamp(value, timezone.utc).date().isoformat()
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).date().isoformat()
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+
+
+def record_day(res: HarnessResult, day: str | None, before: dict) -> None:
+    if day is None:
+        return
+    bucket = res.daily.setdefault(day, {})
+    for model, st in res.per_model.items():
+        old = before.get(model, ModelStats())
+        delta = ModelStats()
+        for key, value in vars(st).items():
+            setattr(delta, key, value if isinstance(value, bool) else value - getattr(old, key))
+        if any(v for v in vars(delta).values() if not isinstance(v, bool)):
+            bucket.setdefault(model, ModelStats()).add(delta)
 
 
 # ---------------------------------------------------------------- scoping
@@ -334,6 +366,10 @@ def collect_opencode(pricing: dict, scope: str | None) -> HarnessResult:
             " tokens_cache_read, tokens_cache_write, tokens_reasoning, directory FROM session"
         )
         sessions = cur.fetchall()
+        try:
+            session_dates = dict(cur.execute("SELECT id, time_created FROM session").fetchall())
+        except sqlite3.Error:
+            session_dates = {}
         cur.execute("SELECT session_id, COUNT(*) FROM message GROUP BY session_id")
         msg_counts = dict(cur.fetchall())
         # Per-message model ids: sessions can switch models mid-conversation
@@ -394,6 +430,7 @@ def collect_opencode(pricing: dict, scope: str | None) -> HarnessResult:
         for i, v in enumerate(toks):
             bucket[i] += v
     for sid, raw_model, cost, ti, to, cr, cw, tr, directory in sessions:
+        before = copy.deepcopy(res.per_model)
         verdict = in_scope(directory, scope)
         if verdict is None:
             res.unattributed += 1
@@ -466,6 +503,7 @@ def collect_opencode(pricing: dict, scope: str | None) -> HarnessResult:
             st.cost_usd += max(est, rec_share) if not priced else est
             if not priced and not (cost or 0):
                 st.unpriced = True
+        record_day(res, session_day(session_dates.get(sid)), before)
     return res
 
 
@@ -480,6 +518,8 @@ def collect_codex(pricing: dict, scope: str | None) -> HarnessResult:
         res.note = "no sessions"
         return res
     for path in files:
+        before = copy.deepcopy(res.per_model)
+        day = None
         model_counter: collections.Counter = collections.Counter()
         cwd_counter: collections.Counter = collections.Counter()
         meta_cwd: str | None = None
@@ -495,6 +535,7 @@ def collect_codex(pricing: dict, scope: str | None) -> HarnessResult:
                         obj = json.loads(line)
                     except Exception:
                         continue
+                    day = day or session_day(obj.get("timestamp"))
                     t = obj.get("type")
                     if t == "session_meta":
                         meta_cwd = obj.get("payload", {}).get("cwd") or meta_cwd
@@ -547,6 +588,7 @@ def collect_codex(pricing: dict, scope: str | None) -> HarnessResult:
                 st.unpriced = True
         else:
             st.unpriced = True
+        record_day(res, day, before)
     return res
 
 
@@ -579,6 +621,8 @@ def collect_claude(pricing: dict, scope: str | None) -> HarnessResult:
         res.note = "no sessions"
         return res
     for path in files:
+        before = copy.deepcopy(res.per_model)
+        day = None
         per_file: dict[str, ModelStats] = {}
         cwd_counter: collections.Counter = collections.Counter()
         messages = 0
@@ -596,6 +640,7 @@ def collect_claude(pricing: dict, scope: str | None) -> HarnessResult:
                         obj = json.loads(line)
                     except Exception:
                         continue
+                    day = day or session_day(obj.get("timestamp"))
                     cwd = obj.get("cwd") or (obj.get("message") or {}).get("cwd")
                     if cwd:
                         cwd_counter[cwd] += 1
@@ -672,6 +717,7 @@ def collect_claude(pricing: dict, scope: str | None) -> HarnessResult:
             dst.cost_usd += est
             if not priced:
                 dst.unpriced = True
+        record_day(res, day, before)
     return res
 
 
@@ -688,10 +734,13 @@ def collect_gemini(pricing: dict, scope: str | None) -> HarnessResult:
         res.note = "no sessions"
         return res
     for path in files:
+        before = copy.deepcopy(res.per_model)
+        day = None
         try:
             data = json.loads(path.read_text(errors="replace"))
         except Exception:
             continue
+        day = session_day(data.get("startTime") or data.get("timestamp"))
         sess_dir = data.get("cwd") or data.get("directory") or data.get("projectRoot") or data.get("root")
         verdict = in_scope(sess_dir, scope)
         if verdict is None:
@@ -724,6 +773,7 @@ def collect_gemini(pricing: dict, scope: str | None) -> HarnessResult:
         st.cost_usd += est
         if not priced:
             st.unpriced = True
+        record_day(res, day, before)
     return res
 
 
@@ -916,9 +966,19 @@ def render_json(results: list[HarnessResult], scope: str | None) -> str:
             "reasoning_tokens": s.reasoning_tokens,
             "cost_usd": round(s.cost_usd, 4),
             "free_tier": s.free_tier,
+            "unpriced": s.unpriced,
         }
         for m, s in rollup.items()
     }
+    out["daily"] = {
+        r.harness: {
+            day: {m: {**vars(st), "cache_read_tokens": st.cache_read,
+                       "cache_write_tokens": st.cache_write} for m, st in bucket.items()}
+            for day, bucket in sorted(r.daily.items())
+        } for r in results
+    }
+    today = datetime.now(timezone.utc).date()
+    out["chart_dates"] = [(today - timedelta(days=i)).isoformat() for i in reversed(range(90))]
     return json.dumps(out, indent=2)
 
 

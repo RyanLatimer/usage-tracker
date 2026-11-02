@@ -27,9 +27,11 @@ jobs:
         run: cargo build --release --target $TARGET
       - name: Pack .app
         run: |
-          VERSION="${GITHUB_REF_NAME#native-v}"
-          VERSION="${VERSION#v}"
-          [ -z "$VERSION" ] || [[ "$VERSION" == *"heads"* ]] && VERSION="0.1.0"
+          VERSION="0.2.0"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME#native-v}"
+            VERSION="${VERSION#v}"
+          fi
           ./native/pack-mac.sh \
             "native/target/$TARGET/release/agent-usage-rune" \
             dist \
@@ -41,13 +43,29 @@ jobs:
         with:
           name: AgentUsage-darwin-arm64
           path: dist/AgentUsage-darwin-arm64.zip
-      - name: Smoke test (headless snap)
+      - name: Test report aggregation
+        run: |
+          python3 native/test_daily.py
+          cargo test --manifest-path native/Cargo.toml
+      - name: Render dashboard scenes
         run: |
           BIN="native/target/$TARGET/release/agent-usage-rune"
-          "$BIN" --help 2>&1 | head -n 20 || true
-          # headless render of the default + empty scenes (no GPU-required windowing on CI)
-          "$BIN" --snap /tmp/agent-usage.png --scene default --theme dark --size 980x660 || true
-          ls -la /tmp/agent-usage.png || true
+          mkdir -p screenshots
+          "$BIN" --snap screenshots/overview-dark.png --scene demo --theme dark --size 1120x900
+          "$BIN" --snap screenshots/overview-light.png --scene demo-light --theme light --size 1120x900
+          "$BIN" --snap screenshots/empty.png --scene empty --theme dark --size 900x620
+          "$BIN" --scene demo --theme dark --script native/scripts/filter.json --tree screenshots/filtered.json --snap screenshots/filtered.png --size 900x620
+          python3 - <<'PYTEST'
+          import json
+          elements = {e['key']: e for e in json.load(open('screenshots/filtered.json'))['elements']}
+          assert elements['title']['text'] == 'Claude Code'
+          assert elements['models-count']['text'] == '1'
+          assert elements['spend-value']['text'] == '$4.06'
+          PYTEST
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-screenshots
+          path: screenshots/
 
   release:
     if: startsWith(github.ref, 'refs/tags/')
