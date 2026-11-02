@@ -46,7 +46,7 @@ jobs:
       - name: Test report aggregation
         run: |
           python3 native/test_daily.py
-          cargo test --manifest-path native/Cargo.toml
+          cargo test --release --target "$TARGET" --manifest-path native/Cargo.toml
       - name: Render dashboard scenes
         run: |
           BIN="native/target/$TARGET/release/agent-usage-rune"

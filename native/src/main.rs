@@ -1247,6 +1247,7 @@ fn main() {
             }),
             ("empty", |s: &mut State| {
                 s.report = Report::default();
+                s.all_report = Report::default();
                 s.error = None;
             }),
         ],
