@@ -101,13 +101,12 @@ Keys: `g` toggle global/dir scope · `r` refresh · `t` theme (Auto/Light/Dark).
 Buttons for the same actions are in the header.
 
 GitHub Actions (`.github/workflows/native-mac.yml`) builds on every push to
-`main` touching `native/**`:
+`main`/`master` touching `native/**`:
 - `macos-14` → `AgentUsage-darwin-arm64.zip` (Apple Silicon)
-- `macos-13` → `AgentUsage-darwin-x64.zip` (Intel Mac)
 
-Each zip contains `AgentUsage.app` (ad-hoc signed, not notarized —
+The zip contains `AgentUsage.app` (ad-hoc signed, not notarized —
 first launch: right-click → Open). Tagged pushes (`v*` / `native-v*`)
-attach both zips to the GitHub Release.
+attach the zip to the GitHub Release.
 
 Cross-compile for other machines (from Linux, no Mac needed):
 

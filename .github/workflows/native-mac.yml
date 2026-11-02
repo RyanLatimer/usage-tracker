@@ -13,44 +13,37 @@ permissions:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-14
-            target: aarch64-apple-darwin
-            arch: darwin-arm64
-          - os: macos-13
-            target: x86_64-apple-darwin
-            arch: darwin-x64
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-14
+    env:
+      TARGET: aarch64-apple-darwin
+      ARCH: darwin-arm64
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-apple-darwin
       - name: Build release binary
         working-directory: native
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target $TARGET
       - name: Pack .app
         run: |
           VERSION="${GITHUB_REF_NAME#native-v}"
           VERSION="${VERSION#v}"
           [ -z "$VERSION" ] || [[ "$VERSION" == *"heads"* ]] && VERSION="0.1.0"
           ./native/pack-mac.sh \
-            "native/target/${{ matrix.target }}/release/agent-usage-rune" \
+            "native/target/$TARGET/release/agent-usage-rune" \
             dist \
             "Agent Usage" \
             "com.local.agent-usage-rune" \
             "$VERSION"
-          cd dist && zip -r -y "AgentUsage-${{ matrix.arch }}.zip" "AgentUsage.app"
+          cd dist && zip -r -y "AgentUsage-$ARCH.zip" "AgentUsage.app"
       - uses: actions/upload-artifact@v4
         with:
-          name: AgentUsage-${{ matrix.arch }}
-          path: dist/AgentUsage-${{ matrix.arch }}.zip
+          name: AgentUsage-darwin-arm64
+          path: dist/AgentUsage-darwin-arm64.zip
       - name: Smoke test (headless snap)
         run: |
-          BIN="native/target/${{ matrix.target }}/release/agent-usage-rune"
+          BIN="native/target/$TARGET/release/agent-usage-rune"
           "$BIN" --help 2>&1 | head -n 20 || true
           # headless render of the default + empty scenes (no GPU-required windowing on CI)
           "$BIN" --snap /tmp/agent-usage.png --scene default --theme dark --size 980x660 || true
